@@ -16,6 +16,7 @@ services:
   kong:
     ports: !reset []
     environment:
+      
       KONG_PORT_MAPS: "443:8000,443:8443"
 
   caddy:
