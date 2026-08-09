@@ -1,4 +1,5 @@
 **Status:** Proposal; Not implemented yet.
+
 **Scope:**
 
 - New: `volumes/functions/main/errors.ts`
@@ -7,9 +8,9 @@
 
 **References:**
 
-- Error codes
-- Status codes
-- Edge Runtime
+- [Error codes](https://supabase.com/docs/guides/functions/error-codes)
+- [Status codes](https://supabase.com/docs/guides/functions/status-codes)
+- [Edge Runtime](https://github.com/supabase/edge-runtime)
 
 ## 1. Problem statement
 
