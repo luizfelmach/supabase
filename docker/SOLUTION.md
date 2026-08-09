@@ -511,8 +511,7 @@ Prerequisites:
 | 6 | Invalid asymmetric JWT | Bearer ES256/RS256 JWT signed with an unknown key | 401 + `UNAUTHORIZED_ASYMMETRIC_JWT` / `Invalid JWT` |
 | 7 | Function not provided | `curl -i $BASE/` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
 | 8 | Unknown function | `curl -i $BASE/does-not-exist` (valid auth) | 404 + `NOT_FOUND` |
-| 9 | Boot error | `curl -i $BASE/boot-error` (valid auth)curl -i $BASE/boot-error
-(valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
+| 9 | Boot error | `curl -i $BASE/boot-error` (valid auth)curl -i $BASE/boot-error (valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
 | 10 | Boot error (bad import) | `curl -i $BASE/bad-import` (valid auth) | 503 + `BOOT_ERROR` |
 | 11 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
 | 12 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` |
