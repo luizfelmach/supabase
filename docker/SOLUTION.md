@@ -140,20 +140,20 @@ These are **two fully independent timers that run concurrently** — neither can
 Three files:
 
 - **`volumes/functions/main/errors.ts` (new)** — single source of truth for the contract:
-    - `EdgeErrorDefinition` — **`{ code, status }` only** (§2: messages are attached where each failure is classified, not in the catalog).
+    - `ErrorDefinition` — **`{ code, status }` only** (§2: messages are attached where each failure is classified, not in the catalog).
     - `ERRORS` — catalog with the 11 portable code/status pairs.
     - `errorResponse(def, message)` — builds the contract `Response` (JSON body + `sb-error-code` header).
-    - `AuthError` — an `Error` subclass carrying its `EdgeErrorDefinition`, so the JWT path classifies the failure where it is detected.
-    - `fromRuntimeError(e)` — `instanceof` chain against `Deno.errors.*` (§3), mirroring the official example main; returns the catalog entry **with** its message (worker-error messages are static per class). Unknown errors fall back to `EDGE_FUNCTION_ERROR` so the client always gets the contract shape, while the raw error stays in the logs.
-    - `tagEdgeFunctionError(response)` — adds the `sb-error-code: EDGE_FUNCTION_ERROR` header to 5XX responses produced by the user function; anything below 500 passes through untouched.
+    - `AuthError` — an `Error` subclass carrying its `ErrorDefinition`, so the JWT path classifies the failure where it is detected.
+    - `resolveRuntimeError(e)` — `instanceof` chain against `Deno.errors.*` (§3), mirroring the official example main; returns the catalog entry **with** its message (worker-error messages are static per class). Unknown errors fall back to `EDGE_FUNCTION_ERROR` so the client always gets the contract shape, while the raw error stays in the logs.
+    - `handleWorkerResponse(response)` — post-processing hook for user-worker responses. Today it adds the `sb-error-code: EDGE_FUNCTION_ERROR` header to 5XX responses; anything below 500 passes through untouched. It is also the designated extension point for future response-side contract rules (e.g. `INVALID_RESPONSE_STATUS_CODE`, §7.8).
 - **`volumes/functions/main/index.ts` (modified)** — behavior changes:
     1. `getAuthToken` throws `AuthError(UNAUTHORIZED_NO_AUTH_HEADER, ...)` / `AuthError(UNAUTHORIZED_INVALID_JWT_FORMAT, "Auth header is not 'Bearer {token}'")`.
     2. JWT verification throws `AuthError`: unsupported `alg` → `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` with message `Unsupported JWT algorithm <alg>`; HS256 failure → `UNAUTHORIZED_LEGACY_JWT`; ES256/RS256 failure → `UNAUTHORIZED_ASYMMETRIC_JWT`; malformed JWT (`jose.decodeProtectedHeader` throws) → `UNAUTHORIZED_INVALID_JWT_FORMAT`.
     3. Missing function name: `400 {"msg": ...}` → **404 `NOT_FOUND`** (deliberate breaking change, §7.1).
     4. Pre-flight `Deno.stat(servicePath)` → 404 `NOT_FOUND` for unknown functions (§3).
     5. `workerTimeoutMs` raised 60s → 400s so the idle-timeout flag governs slow functions (§4).
-    6. `worker.fetch()` responses pass through `tagEdgeFunctionError`, which tags 5XX with the contract header — body and status preserved, matching the Platform's `500 Internal Server Error` + header behavior.
-    7. Worker create/fetch `catch` → `const { def, message } = fromRuntimeError(e)` + `errorResponse(def, message)`; raw error logged via `console.error`.
+    6. `worker.fetch()` responses pass through `handleWorkerResponse`, which tags 5XX with the contract header — body and status preserved, matching the Platform's `500 Internal Server Error` + header behavior.
+    7. Worker create/fetch `catch` → `const { def, message } = resolveRuntimeError(e)` + `errorResponse(def, message)`; raw error logged via `console.error`.
 - **`docker-compose.yml` (modified)** — add `-user-worker-request-idle-timeout 150000` to the `functions` command (§4).
 
 ## 6. Proposed code
@@ -161,12 +161,12 @@ Three files:
 ### 6.1 `volumes/functions/main/errors.ts` (new file, complete)
 
 ```tsx
-export interface EdgeErrorDefinition {
+export interface ErrorDefinition {
   code: string
   status: number
 }
 
-export const ERRORS: Record<string, EdgeErrorDefinition> = {
+export const ERRORS: Record<string, ErrorDefinition> = {
   // Server errors
   NOT_FOUND: { code: 'NOT_FOUND', status: 404 },
   BOOT_ERROR: { code: 'BOOT_ERROR', status: 503 },
@@ -185,7 +185,7 @@ export const ERRORS: Record<string, EdgeErrorDefinition> = {
   UNAUTHORIZED_ASYMMETRIC_JWT: { code: 'UNAUTHORIZED_ASYMMETRIC_JWT', status: 401 },
 }
 
-export function errorResponse(def: EdgeErrorDefinition, message: string): Response {
+export function errorResponse(def: ErrorDefinition, message: string): Response {
   return new Response(JSON.stringify({ code: def.code, message }), {
     status: def.status,
     headers: {
@@ -195,7 +195,8 @@ export function errorResponse(def: EdgeErrorDefinition, message: string): Respon
   })
 }
 
-export function tagEdgeFunctionError(response: Response): Response {
+// Post-processing hook for user-worker responses.
+export function handleWorkerResponse(response: Response): Response {
   if (response.status < 500) return response
 
   const headers = new Headers(response.headers)
@@ -208,16 +209,16 @@ export function tagEdgeFunctionError(response: Response): Response {
 }
 
 export class AuthError extends Error {
-  readonly def: EdgeErrorDefinition
+  readonly def: ErrorDefinition
 
-  constructor(def: EdgeErrorDefinition, message: string) {
+  constructor(def: ErrorDefinition, message: string) {
     super(message)
     this.name = 'AuthError'
     this.def = def
   }
 }
 
-export function fromRuntimeError(e: unknown): { def: EdgeErrorDefinition; message: string } {
+export function resolveRuntimeError(e: unknown): { def: ErrorDefinition; message: string } {
   if (e instanceof Deno.errors.InvalidWorkerCreation) {
     return {
       def: ERRORS.BOOT_ERROR,
@@ -261,7 +262,7 @@ export function fromRuntimeError(e: unknown): { def: EdgeErrorDefinition; messag
 
 ```diff
  import * as jose from 'jsr:@panva/jose@6'
-+import { AuthError, ERRORS, errorResponse, fromRuntimeError, tagEdgeFunctionError } from './errors.ts'
++import { AuthError, ERRORS, errorResponse, handleWorkerResponse, resolveRuntimeError } from './errors.ts'
 
  console.log('main function started')
 ```
@@ -419,8 +420,6 @@ Every classified failure in the auth path is an `AuthError` by construction — 
    const servicePath = `/home/deno/functions/${service_name}`
    console.error(`serving the request with ${servicePath}`)
 +
-+  // Distinguish "never deployed" (404) from a boot failure, since the
-+  // runtime reports both as InvalidWorkerCreation.
 +  try {
 +    await Deno.stat(servicePath)
 +  } catch {
@@ -433,7 +432,6 @@ Every classified failure in the auth path is an `AuthError` by construction — 
 ```diff
    const memoryLimitMb = 150
 -  const workerTimeoutMs = 1 * 60 * 1000
-+  // Runtime default; must stay above --user-worker-request-idle-timeout
 +  const workerTimeoutMs = 400_000
 ```
 
@@ -456,11 +454,11 @@ Every classified failure in the auth path is an `AuthError` by construction — 
 -      headers: { 'Content-Type': 'application/json' },
 -    })
 -  }
-+    return tagEdgeFunctionError(await worker.fetch(req))
++    return handleWorkerResponse(await worker.fetch(req))
 +  } catch (e) {
 +    console.error(e)
 +
-+    const { def, message } = fromRuntimeError(e)
++    const { def, message } = resolveRuntimeError(e)
 +    return errorResponse(def, message)
 +  }
  })
@@ -489,11 +487,10 @@ Add the request idle-timeout flag to the `functions` service:
 1. **Breaking change: 400 → 404 for a missing function name.** Today `GET /functions/v1/` (empty function segment) answers `400 {"msg":"missing function name in request"}`. The Platform answers `404 NOT_FOUND` for the same request, so this proposal changes the status deliberately. Anything depending on the 400 (health checks, scripts) must be updated.
 2. **`NOT_FOUND` vs `BOOT_ERROR`.** Both surface from the runtime as `InvalidWorkerCreation` (§3); the pre-flight `Deno.stat(servicePath)` is what separates "never deployed" (404) from "failed to boot" (503). It adds one `stat` syscall per request — negligible next to a worker boot.
 3. **`Bearer` without a token** (`Authorization: Bearer` with nothing after) now yields `UNAUTHORIZED_INVALID_JWT_FORMAT` instead of falling through to a JWT parse error. Minor hardening, same code family.
-4. **Messages live where each failure is classified, not in the catalog.** Only `code` and `status` are contractual (§2). Auth messages sit at their throw sites — that is where the dynamic `alg` value (`PS256`) is known — and worker-error messages sit in `fromRuntimeError`, next to the `instanceof` mapping. The `IDLE_TIMEOUT` message deliberately omits the limit value — that Platform nicety is not mirrored.
-5. **`instanceof` via `Deno.errors.*`.** The runtime exposes its worker error classes on the `Deno` global (§3), and the official example main classifies worker failures exactly this way (`examples/main/index.ts:243-255`) — so `fromRuntimeError` is an `instanceof` chain, with no string matching on error names or messages.
-6. **`EDGE_FUNCTION_ERROR` is a header tag, not a body rewrite.** When the user function fails at request time, the runtime already forwards the plain `500 Internal Server Error` response; `tagEdgeFunctionError` only adds `sb-error-code: EDGE_FUNCTION_ERROR`, exactly like the Platform. The same code is also the fallback for unrecognized runtime errors in `fromRuntimeError`, where the raw error goes to `console.error` only — contract messages must not leak internals.
+4. **Messages live where each failure is classified, not in the catalog.** Only `code` and `status` are contractual (§2). Auth messages sit at their throw sites — that is where the dynamic `alg` value (`PS256`) is known — and worker-error messages sit in `resolveRuntimeError`, next to the `instanceof` mapping. The `IDLE_TIMEOUT` message deliberately omits the limit value — that Platform nicety is not mirrored.
+5. **`instanceof` via `Deno.errors.*`.** The runtime exposes its worker error classes on the `Deno` global (§3), and the official example main classifies worker failures exactly this way (`examples/main/index.ts:243-255`) — so `resolveRuntimeError` is an `instanceof` chain, with no string matching on error names or messages.
+6. **`EDGE_FUNCTION_ERROR` is a header tag, not a body rewrite.** When the user function fails at request time, the runtime already forwards the plain `500 Internal Server Error` response; `handleWorkerResponse` only adds `sb-error-code: EDGE_FUNCTION_ERROR`, exactly like the Platform. The same code is also the fallback for unrecognized runtime errors in `resolveRuntimeError`, where the raw error goes to `console.error` only — contract messages must not leak internals.
 7. **`WorkerRequestCancelled` ambiguity.** OOM kills and wall-clock expiry produce the same error name and message. With the §4 ordering (idle 150s < wall clock 400s), slow functions are claimed by `IDLE_TIMEOUT` first, so `WorkerRequestCancelled → WORKER_RESOURCE_LIMIT` is only reached for genuine resource/termination cases — matching Platform behavior. Residual ambiguity (a 400s-long request being cancelled) is inherent to the runtime and accepted.
-8. **`INVALID_RESPONSE_STATUS_CODE` stays unmapped** (❌): the runtime logs the bad status but the client-facing response carries no such code, so there is nothing to emit.
 9. **Logging is preserved.** Every catch path still `console.error`s the original error — the contract messages that say "please check logs" rely on it.
 
 ## 8. Test plan (next phase — not executed yet)
