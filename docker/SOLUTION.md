@@ -91,7 +91,7 @@ The typed errors live in `ext/workers/errors.rs:3-11` (`WorkerError::{RequestCan
 | --- | --- | --- |
 | `InvalidWorkerCreation` | `lib.rs:304-317` (create) | `BOOT_ERROR` (503) |
 | `WorkerRequestCancelled` | `lib.rs:630-633` (fetch) | `WORKER_RESOURCE_LIMIT` (546) |
-| `WorkerAlreadyRetired` | `lib.rs:634-636` (fetch) | `WORKER_ERROR` (500) — transient; see the retry algorithm in the docs |
+| `WorkerAlreadyRetired` | `lib.rs:634-636` (fetch) | `WORKER_ERROR` (500) — Transient; See the retry algorithm in the docs |
 | `WorkerRequestIdleTimeout` | `lib.rs:637-642` (fetch) | `IDLE_TIMEOUT` (504) |
 | `InvalidWorkerResponse` | `lib.rs:643-647` (fetch) | `WORKER_ERROR` (500) |
 
