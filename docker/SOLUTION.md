@@ -161,73 +161,31 @@ Three files:
 ### 6.1 `volumes/functions/main/errors.ts` (new file, complete)
 
 ```tsx
-/**
- * errors.ts — Supabase Platform error contract for the self-hosted Edge
- * Functions main worker.
- *
- * On the hosted Platform, every failing Edge Function response follows one
- * contract:
- *
- *   - a specific HTTP status code,
- *   - a JSON body of the form `{ "code": string, "message": string }`,
- *   - an `sb-error-code` response header mirroring the body's `code`.
- *
- * Only `code` and `status` are fixed; `message` is human-readable and can be
- * dynamic (the Platform itself varies messages per code), so messages live
- * where each failure is classified, not in this catalog.
- *
- * Docs: <https://supabase.com/docs/guides/functions/error-codes>
- */
-
-/** One entry of the error contract catalog. */
 export interface EdgeErrorDefinition {
-  /** Machine-readable code. Sent in the body and as the `sb-error-code` header. */
   code: string
-  /** HTTP status code of the response. */
   status: number
 }
 
-/**
- * Error catalog — the subset of the documented Platform codes that the
- * self-hosted main worker can actually emit.
- */
 export const ERRORS: Record<string, EdgeErrorDefinition> = {
-  // --- Server errors ---
+  // Server errors
   NOT_FOUND: { code: 'NOT_FOUND', status: 404 },
   BOOT_ERROR: { code: 'BOOT_ERROR', status: 503 },
 
-  // --- Bad implementation errors ---
+  // Bad implementation errors
   EDGE_FUNCTION_ERROR: { code: 'EDGE_FUNCTION_ERROR', status: 500 },
   IDLE_TIMEOUT: { code: 'IDLE_TIMEOUT', status: 504 },
   WORKER_RESOURCE_LIMIT: { code: 'WORKER_RESOURCE_LIMIT', status: 546 },
   WORKER_ERROR: { code: 'WORKER_ERROR', status: 500 },
 
-  // --- Authentication errors ---
+  // Authentication errors
   UNAUTHORIZED_NO_AUTH_HEADER: { code: 'UNAUTHORIZED_NO_AUTH_HEADER', status: 401 },
-  UNAUTHORIZED_INVALID_JWT_FORMAT: {
-    code: 'UNAUTHORIZED_INVALID_JWT_FORMAT',
-    status: 401,
-  },
-  UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM: {
-    code: 'UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM',
-    status: 401,
-  },
+  UNAUTHORIZED_INVALID_JWT_FORMAT: { code: 'UNAUTHORIZED_INVALID_JWT_FORMAT', status: 401 },
+  UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM: { code: 'UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM', status: 401 },
   UNAUTHORIZED_LEGACY_JWT: { code: 'UNAUTHORIZED_LEGACY_JWT', status: 401 },
   UNAUTHORIZED_ASYMMETRIC_JWT: { code: 'UNAUTHORIZED_ASYMMETRIC_JWT', status: 401 },
 }
 
-/**
- * Builds a contract-compliant error response: JSON `{ code, message }` body
- * plus the `sb-error-code` header.
- *
- * @param def     Catalog entry to answer with.
- * @param message Client-facing message. Must never leak runtime internals
- *                (stack traces, file paths); those stay in the logs.
- */
-export function errorResponse(
-  def: EdgeErrorDefinition,
-  message: string,
-): Response {
+export function errorResponse(def: EdgeErrorDefinition, message: string): Response {
   return new Response(JSON.stringify({ code: def.code, message }), {
     status: def.status,
     headers: {
@@ -237,12 +195,6 @@ export function errorResponse(
   })
 }
 
-/**
- * Adds the `sb-error-code: EDGE_FUNCTION_ERROR` header to 5XX responses
- * produced by the user function — the runtime forwards them as plain
- * responses, and the Platform tags them the same way. Responses below 500
- * are returned untouched.
- */
 export function tagEdgeFunctionError(response: Response): Response {
   if (response.status < 500) return response
 
@@ -255,11 +207,6 @@ export function tagEdgeFunctionError(response: Response): Response {
   })
 }
 
-/**
- * Auth failure carrying its catalog entry. Thrown by the JWT verification path
- * in `index.ts`, where the failure reason (missing header, bad format,
- * unsupported algorithm, legacy vs. asymmetric key) is known.
- */
 export class AuthError extends Error {
   readonly def: EdgeErrorDefinition
 
@@ -270,38 +217,12 @@ export class AuthError extends Error {
   }
 }
 
-/**
- * Classifies an error thrown by `EdgeRuntime.userWorkers.create()` or
- * `worker.fetch()`, returning the catalog entry together with the
- * client-facing message.
- *
- * The runtime reconstructs these failures as real `Error` subclasses and
- * exposes them as `Deno.errors.*` (classes built per isolate at
- * ext/runtime/js/errors.js:9-32, attached to the `Deno` global via
- * ext/runtime/js/denoOverrides.js:9), so classification is a plain
- * `instanceof` chain — the same idiom used by the official example main
- * (examples/main/index.ts:243-255). The classes exist only on the
- * runtime-provided `Deno` global, not in stock Deno type definitions; the
- * edge-runtime strips types without type-checking.
- *
- * Mapping (typed enum at ext/workers/errors.rs:3-11; class names attached at
- * ext/workers/lib.rs, create: 304-317, fetch: 630-647):
- *
- *   InvalidWorkerCreation     -> BOOT_ERROR
- *   WorkerRequestCancelled    -> WORKER_RESOURCE_LIMIT
- *   WorkerAlreadyRetired      -> WORKER_ERROR
- *   WorkerRequestIdleTimeout  -> IDLE_TIMEOUT
- *   InvalidWorkerResponse     -> WORKER_ERROR
- *
- * Unknown errors fall back to `EDGE_FUNCTION_ERROR` so the client always
- * receives the contract shape; the raw error is expected to be logged by the
- * caller.
- */
-export function fromRuntimeError(
-  e: unknown,
-): { def: EdgeErrorDefinition; message: string } {
+export function fromRuntimeError(e: unknown): { def: EdgeErrorDefinition; message: string } {
   if (e instanceof Deno.errors.InvalidWorkerCreation) {
-    return { def: ERRORS.BOOT_ERROR, message: 'Function failed to start (please check logs)' }
+    return {
+      def: ERRORS.BOOT_ERROR,
+      message: 'Function failed to start (please check logs)',
+    }
   }
   if (e instanceof Deno.errors.WorkerRequestCancelled) {
     return {
@@ -310,15 +231,27 @@ export function fromRuntimeError(
     }
   }
   if (e instanceof Deno.errors.WorkerAlreadyRetired) {
-    return { def: ERRORS.WORKER_ERROR, message: 'Function exited due to an error (please check logs)' }
+    return {
+      def: ERRORS.WORKER_ERROR,
+      message: 'Function exited due to an error (please check logs)',
+    }
   }
   if (e instanceof Deno.errors.WorkerRequestIdleTimeout) {
-    return { def: ERRORS.IDLE_TIMEOUT, message: 'Request idle timeout limit reached' }
+    return {
+      def: ERRORS.IDLE_TIMEOUT,
+      message: 'Request idle timeout limit reached',
+    }
   }
   if (e instanceof Deno.errors.InvalidWorkerResponse) {
-    return { def: ERRORS.WORKER_ERROR, message: 'Function exited due to an error (please check logs)' }
+    return {
+      def: ERRORS.WORKER_ERROR,
+      message: 'Function exited due to an error (please check logs)',
+    }
   }
-  return { def: ERRORS.EDGE_FUNCTION_ERROR, message: 'Internal Server Error' }
+  return {
+    def: ERRORS.EDGE_FUNCTION_ERROR,
+    message: 'Internal Server Error',
+  }
 }
 ```
 
