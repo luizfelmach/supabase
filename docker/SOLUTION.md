@@ -97,7 +97,7 @@ The typed errors live in `ext/workers/errors.rs:3-11` (`WorkerError::{RequestCan
 
 On the JS side, the runtime reconstructs these as real `Error` subclasses **and exposes them to user code as `Deno.errors.*`**: `ext/runtime/js/errors.js:9-32` builds one class per name (`class extends Error { constructor(msg) { super(msg); this.name = name } }`), registers them via `core.registerErrorClass` (`errors.js:77-82`, wired into every isolate's bootstrap at `ext/runtime/js/bootstrap.js:386`), and exports the full set (`errors.js:131`), which the Deno namespace overrides attach to the `Deno` global (`ext/runtime/js/denoOverrides.js:9`). So in the main worker's `catch (e)`:
 
-- `e instanceof Deno.errors.WorkerRequestIdleTimeout` (etc.) **just works** — this is exactly how the official example main classifies worker errors (`examples/main/index.ts:243-255`):
+- `e instanceof Deno.errors.WorkerRequestIdleTimeout` (etc.) **just works**.
     
     ```tsx
     if (e instanceof Deno.errors.WorkerAlreadyRetired) { /* retry */ }
