@@ -1,6 +1,15 @@
-**Status:** Proposal. Not implemented yet.
-**Scope:** 3 files — `volumes/functions/main/errors.ts` (new), `volumes/functions/main/index.ts` (modified), `docker-compose.yml` (modified)
-**References:** Error codes, Status codes, edge-runtime source at `~/Supabase/edge-runtime` (line numbers cited from that checkout; the compose stack pins `supabase/edge-runtime:v1.74.0` — the mechanism is stable across recent versions, exact lines may differ)
+**Status:** Proposal; Not implemented yet.
+**Scope:**
+
+- New: `volumes/functions/main/errors.ts`
+- Modified: `volumes/functions/main/index.ts`
+- Modified: `docker-compose.yml`
+
+**References:**
+
+- Error codes
+- Status codes
+- Edge Runtime
 
 ## 1. Problem statement
 
