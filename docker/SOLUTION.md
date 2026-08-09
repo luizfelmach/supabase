@@ -493,7 +493,7 @@ Add the request idle-timeout flag to the `functions` service:
 7. **`WorkerRequestCancelled` ambiguity.** OOM kills and wall-clock expiry produce the same error name and message. With the §4 ordering (idle 150s < wall clock 400s), slow functions are claimed by `IDLE_TIMEOUT` first, so `WorkerRequestCancelled → WORKER_RESOURCE_LIMIT` is only reached for genuine resource/termination cases — matching Platform behavior. Residual ambiguity (a 400s-long request being cancelled) is inherent to the runtime and accepted.
 9. **Logging is preserved.** Every catch path still `console.error`s the original error — the contract messages that say "please check logs" rely on it.
 
-## 8. Test plan (next phase — not executed yet)
+## 8. Test plan
 
 Prerequisites:
 
