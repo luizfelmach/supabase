@@ -503,16 +503,16 @@ Prerequisites:
 
 | # | Scenario | Trigger | Expected |
 | --- | --- | --- | --- |
-| 1 | No auth header | `curl -i $BASE/hello` (no `Authorization`) | 401 + `{"code":"UNAUTHORIZED_NO_AUTH_HEADER","message":"Missing authorization header"}` + header |
+| 1 | No auth header | `curl -i $BASE/hello` (no `Authorization` header) | 401 + `UNAUTHORIZED_NO_AUTH_HEADER` / `Missing authorization header` |
 | 2 | Bad Bearer format | `curl -i $BASE/hello -H "Authorization: Token abc"` | 401 + `UNAUTHORIZED_INVALID_JWT_FORMAT` / `Auth header is not 'Bearer {token}'` |
 | 3 | Malformed JWT | `curl -i $BASE/hello -H "Authorization: Bearer abc"` | 401 + `UNAUTHORIZED_INVALID_JWT_FORMAT` / `Invalid JWT` |
-| 4 | Unsupported algorithm | Bearer PS256-signed JWT | 401 + `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` / `Unsupported JWT algorithm PS256` |
-| 5 | Invalid legacy JWT | Bearer HS256 JWT signed with the wrong secret | 401 + `UNAUTHORIZED_LEGACY_JWT` / `Invalid JWT` |
-| 6 | Invalid asymmetric JWT | Bearer ES256/RS256 JWT signed with an unknown key | 401 + `UNAUTHORIZED_ASYMMETRIC_JWT` / `Invalid JWT` |
+| 4 | Unsupported algorithm | `curl -i $BASE/hello -H "Authorization: Bearer <PS256 JWT>"` | 401 + `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` / `Unsupported JWT algorithm PS256` |
+| 5 | Invalid legacy JWT | `curl -i $BASE/hello -H "Authorization: Bearer <HS256 JWT, wrong secret>"` | 401 + `UNAUTHORIZED_LEGACY_JWT` / `Invalid JWT` |
+| 6 | Invalid asymmetric JWT | `curl -i $BASE/hello -H "Authorization: Bearer <ES256/RS256 JWT, unknown key>"` | 401 + `UNAUTHORIZED_ASYMMETRIC_JWT` / `Invalid JWT` |
 | 7 | Function not provided | `curl -i $BASE/` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
-| 8 | Unknown function | `curl -i $BASE/does-not-exist` (valid auth) | 404 + `NOT_FOUND` |
+| 8 | Unknown function | `curl -i $BASE/does-not-exist` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
 | 9 | Boot error | `curl -i $BASE/boot-error` (valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
 | 10 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
-| 11 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` |
-| 12 | Unhandled error in handler | `curl -i $BASE/error` (valid Auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
-| 13 | Happy path | `curl -i $BASE/hello` (valid auth) | 200, unchanged body, no `sb-error-code` |
+| 11 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` / `Function failed due to not having enough compute resources (please check logs)` |
+| 12 | Unhandled error in handler | `curl -i $BASE/error` (valid auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
+| 13 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header |
