@@ -511,16 +511,8 @@ Prerequisites:
 | 6 | Invalid asymmetric JWT | Bearer ES256/RS256 JWT signed with an unknown key | 401 + `UNAUTHORIZED_ASYMMETRIC_JWT` / `Invalid JWT` |
 | 7 | Function not provided | `curl -i $BASE/` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
 | 8 | Unknown function | `curl -i $BASE/does-not-exist` (valid auth) | 404 + `NOT_FOUND` |
-| 9 | Boot error | `curl -i $BASE/boot-error` (valid auth)curl -i $BASE/boot-error (valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
-| 10 | Boot error (bad import) | `curl -i $BASE/bad-import` (valid auth) | 503 + `BOOT_ERROR` |
+| 9 | Boot error | `curl -i $BASE/boot-error` (valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
 | 11 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
 | 12 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` |
-| 13 | Unhandled error in handler | `curl -i $BASE/error` — needs a new test function: `Deno.serve(() => { throw new Error('boom') })` | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
-| 14 | Happy path | `curl -i $BASE/hello -X POST -H "Authorization: Bearer $ANON_KEY" -d '{}'` | 200, unchanged body, no `sb-error-code` |
-
-Notes:
-
-- Scenarios 9–10 rely on the existing `boot-error` and `bad-import` functions; 11–12 on `hog1`/`oom`; 13 needs one new one-file function under `volumes/functions/error/`.
-- Scenario 11 takes 150s with the parity configuration. For a fast check, temporarily lower the compose flag (e.g. `5000`) — then revert.
-- `WORKER_ERROR` (`InvalidWorkerResponse`, `WorkerAlreadyRetired`) comes from event-loop-level failures and worker retirement; it is transient and best validated by correlating the response with `docker logs supabase-edge-functions`.
-- A regression script (e.g. `tests/test-error-contract.sh`) asserting status + body + header per row can automate this table once the proposal is validated manually.
+| 13 | Unhandled error in handler | `curl -i $BASE/error` (valid Auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
+| 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200, unchanged body, no `sb-error-code` |
