@@ -512,7 +512,7 @@ Prerequisites:
 | 7 | Function not provided | `curl -i $BASE/` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
 | 8 | Unknown function | `curl -i $BASE/does-not-exist` (valid auth) | 404 + `NOT_FOUND` |
 | 9 | Boot error | `curl -i $BASE/boot-error` (valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
-| 11 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
-| 12 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` |
-| 13 | Unhandled error in handler | `curl -i $BASE/error` (valid Auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
-| 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200, unchanged body, no `sb-error-code` |
+| 10 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
+| 11 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` |
+| 12 | Unhandled error in handler | `curl -i $BASE/error` (valid Auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
+| 13 | Happy path | `curl -i $BASE/hello` (valid auth) | 200, unchanged body, no `sb-error-code` |
