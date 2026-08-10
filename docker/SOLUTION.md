@@ -284,7 +284,6 @@ export function resolveRuntimeError(e: unknown): { def: ErrorDefinition; message
 -  const [bearer, token] = authHeader.split(' ')
 -  if (bearer !== 'Bearer') {
 -    throw new Error(`Auth header is not 'Bearer {token}'`)
-+  // Mirror the Platform's extractBearerToken: exactly 'Bearer <token>', no extra parts
 +  const parts = authHeader.split(' ')
 +  if (parts.length !== 2 || parts[0] !== 'Bearer' || !parts[1]) {
 +    throw new AuthError(
