@@ -5,6 +5,8 @@
 - New: `volumes/functions/main/errors.ts`
 - Modified: `volumes/functions/main/index.ts`
 - Modified: `docker-compose.yml`
+- Modified: `volumes/api/kong.yml`
+- Modified: `volumes/api/envoy/lds.template.yaml`
 
 **References:**
 
@@ -134,10 +136,11 @@ These are **two fully independent timers that run concurrently** — neither can
 1. **Stock self-hosted never emits `IDLE_TIMEOUT`.** Without the flag, the idle timer is disabled; a slow function is cancelled by the 60s wall clock and the client sees `WorkerRequestCancelled` — the *same* error name and message as a resource-limit kill (OOM). The two scenarios are indistinguishable in JS.
 2. **The flag must be *lower* than the wall clock to govern slow functions.** On the Platform the ordering is idle (150s) < wall clock (≥400s), so slow functions surface as `IDLE_TIMEOUT`. To reproduce that ordering self-hosted, this proposal pairs the compose change (`-user-worker-request-idle-timeout 150000`, §6.3) with raising `workerTimeoutMs` to the runtime default 400_000 (§6.2). The conservative alternative — keeping `workerTimeoutMs` at 60s and setting the flag below it — also works but diverges from Platform timings.
 3. A third, unrelated timer exists — `-request-wait-timeout` (default 10_000 ms, `flags.rs:201-209`): time to acquire a worker from the pool. Out of scope here.
+4. **The same race exists one layer up, at the gateway.** Kong (`read_timeout`) and Envoy (route `timeout`) both cap functions calls at 150s — exactly the idle flag's value. If the gateway timer fires first, the client gets the gateway's own 504 with no contract body and no `sb-error-code` header. Both are raised to 160s (§6.4), so the full ordering is idle (150s) < gateway (160s) < wall clock (400s) and the runtime always answers first.
 
 ## 5. Design
 
-Three files:
+Five files:
 
 - **`volumes/functions/main/errors.ts` (new)** — single source of truth for the contract:
     - `ErrorDefinition` — **`{ code, status }` only** (§2: messages are attached where each failure is classified, not in the catalog).
@@ -155,6 +158,8 @@ Three files:
     6. `worker.fetch()` responses pass through `handleWorkerResponse`, which tags 5XX with the contract header — body and status preserved, matching the Platform's `500 Internal Server Error` + header behavior.
     7. Worker create/fetch `catch` → `const { def, message } = resolveRuntimeError(e)` + `errorResponse(def, message)`; raw error logged via `console.error`.
 - **`docker-compose.yml` (modified)** — add `-user-worker-request-idle-timeout 150000` to the `functions` command (§4).
+- **`volumes/api/kong.yml` (modified)** — functions `read_timeout` 150s → 160s, so the gateway outlives the idle-timeout response (§4.4, §6.4).
+- **`volumes/api/envoy/lds.template.yaml` (modified)** — same raise for the alternative Envoy gateway (§6.4).
 
 ## 6. Proposed code
 
@@ -482,6 +487,28 @@ Add the request idle-timeout flag to the `functions` service:
 
 150s is the Platform's documented limit. Per §4, the flag must stay below `workerTimeoutMs` — which is why §6.2 raises the wall clock to the runtime default of 400s.
 
+### 6.4 `volumes/api/kong.yml` + `volumes/api/envoy/lds.template.yaml` (changes only)
+
+Raise the gateway's functions timeout above the idle flag, so the runtime always wins the race and the client receives the contract `IDLE_TIMEOUT` response instead of a gateway-generated 504 (§4.4):
+
+```diff
+   - name: functions-v1
+     _comment: 'Edge Functions: /functions/v1/* -> http://functions:9000/*'
+     url: http://functions:9000/
+-    read_timeout: 150000
++    read_timeout: 160000
+```
+
+```diff
+                        route:
+                          cluster: functions
+                          prefix_rewrite: /
+-                         timeout: 150s
++                         timeout: 160s
+```
+
+10s of headroom is ample: when the idle timer fires, the runtime synthesizes the 504 immediately (§4). The gateway must still stay below the wall clock — it does, at 160s < 400s. Both gateways load this config at boot, so recreate the container (`kong` or `envoy`) for the change to take effect.
+
 ## 7. Decisions & edge cases
 
 1. **Breaking change: 400 → 404 for a missing function name.** Today `GET /functions/v1/` (empty function segment) answers `400 {"msg":"missing function name in request"}`. The Platform answers `404 NOT_FOUND` for the same request, so this proposal changes the status deliberately. Anything depending on the 400 (health checks, scripts) must be updated.
@@ -497,7 +524,7 @@ Add the request idle-timeout flag to the `functions` service:
 
 Prerequisites:
 
-1. Apply the three files: `volumes/functions/main/errors.ts` (§6.1), `volumes/functions/main/index.ts` (§6.2), `docker-compose.yml` (§6.3).
+1. Apply the five files: `volumes/functions/main/errors.ts` (§6.1), `volumes/functions/main/index.ts` (§6.2), `docker-compose.yml` (§6.3), `volumes/api/kong.yml` and `volumes/api/envoy/lds.template.yaml` (§6.4).
 2. In `.env`, set `FUNCTIONS_VERIFY_JWT=true` (default is `false`) and recreate the service: `docker compose up -d --force-recreate functions`. No image rebuild is needed — the code is volume-mounted.
 3. Base URL for all checks: `http://localhost:8000/functions/v1` (via Kong). Use `curl -i` (or `D -`) to inspect status, body, **and** the `sb-error-code` header.
 
