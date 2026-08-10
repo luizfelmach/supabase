@@ -150,7 +150,7 @@ Five files:
     - `resolveRuntimeError(e)` — `instanceof` chain against `Deno.errors.*` (§3), mirroring the official example main; returns the catalog entry **with** its message (worker-error messages are static per class). Unknown errors fall back to `EDGE_FUNCTION_ERROR` so the client always gets the contract shape, while the raw error stays in the logs.
     - `handleWorkerResponse(response)` — post-processing hook for user-worker responses. Today it adds the `sb-error-code: EDGE_FUNCTION_ERROR` header to 5XX responses; anything below 500 passes through untouched. It is also the designated extension point for future response-side contract rules (e.g. `INVALID_RESPONSE_STATUS_CODE`, §7.8).
 - **`volumes/functions/main/index.ts` (modified)** — behavior changes:
-    1. `getAuthToken` throws `AuthError(UNAUTHORIZED_NO_AUTH_HEADER, ...)` / `AuthError(UNAUTHORIZED_INVALID_JWT_FORMAT, "Auth header is not 'Bearer {token}'")`.
+    1. `getAuthToken` throws `AuthError(UNAUTHORIZED_NO_AUTH_HEADER, ...)` / `AuthError(UNAUTHORIZED_INVALID_JWT_FORMAT, "Auth header is not 'Bearer {token}'")`. The Bearer parse enforces exactly 2 parts (`Bearer <token>`), mirroring the Platform's `extractBearerToken` — extra segments are rejected instead of silently dropped.
     2. JWT verification throws `AuthError`: unsupported `alg` → `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` with message `Unsupported JWT algorithm <alg>`; HS256 failure → `UNAUTHORIZED_LEGACY_JWT`; ES256/RS256 failure → `UNAUTHORIZED_ASYMMETRIC_JWT`; malformed JWT (`jose.decodeProtectedHeader` throws) → `UNAUTHORIZED_INVALID_JWT_FORMAT`.
     3. Missing function name: `400 {"msg": ...}` → **404 `NOT_FOUND`** (deliberate breaking change, §7.1).
     4. Pre-flight `Deno.stat(servicePath)` → 404 `NOT_FOUND` for unknown functions (§3).
@@ -272,7 +272,7 @@ export function resolveRuntimeError(e: unknown): { def: ErrorDefinition; message
  console.log('main function started')
 ```
 
-**`getAuthToken` — throw classified auth errors** (also treats `Bearer` without a token as invalid format):
+**`getAuthToken` — throw classified auth errors** (now enforces exactly `Bearer <token>` — two parts — mirroring the Platform's `extractBearerToken`):
 
 ```diff
  function getAuthToken(req: Request) {
@@ -281,16 +281,19 @@ export function resolveRuntimeError(e: unknown): { def: ErrorDefinition; message
 -    throw new Error('Missing authorization header')
 +    throw new AuthError(ERRORS.UNAUTHORIZED_NO_AUTH_HEADER, 'Missing authorization header')
    }
-   const [bearer, token] = authHeader.split(' ')
+-  const [bearer, token] = authHeader.split(' ')
 -  if (bearer !== 'Bearer') {
 -    throw new Error(`Auth header is not 'Bearer {token}'`)
-+  if (bearer !== 'Bearer' || !token) {
++  // Mirror the Platform's extractBearerToken: exactly 'Bearer <token>', no extra parts
++  const parts = authHeader.split(' ')
++  if (parts.length !== 2 || parts[0] !== 'Bearer' || !parts[1]) {
 +    throw new AuthError(
 +      ERRORS.UNAUTHORIZED_INVALID_JWT_FORMAT,
 +      `Auth header is not 'Bearer {token}'`,
 +    )
    }
-   return token
+-  return token
++  return parts[1]
  }
 ```
 
@@ -513,7 +516,7 @@ Raise the gateway's functions timeout above the idle flag, so the runtime always
 
 1. **Breaking change: 400 → 404 for a missing function name.** Today `GET /functions/v1/` (empty function segment) answers `400 {"msg":"missing function name in request"}`. The Platform answers `404 NOT_FOUND` for the same request, so this proposal changes the status deliberately. Anything depending on the 400 (health checks, scripts) must be updated.
 2. **`NOT_FOUND` vs `BOOT_ERROR`.** Both surface from the runtime as `InvalidWorkerCreation` (§3); the pre-flight `Deno.stat(servicePath)` is what separates "never deployed" (404) from "failed to boot" (503). It adds one `stat` syscall per request — negligible next to a worker boot.
-3. **`Bearer` without a token** (`Authorization: Bearer` with nothing after) now yields `UNAUTHORIZED_INVALID_JWT_FORMAT` instead of falling through to a JWT parse error. Minor hardening, same code family.
+3. **Bearer parsing is now exact.** `Authorization: Bearer` (no token), `Bearer abc def` (extra parts) and any non-`Bearer` scheme all yield `UNAUTHORIZED_INVALID_JWT_FORMAT`: the Platform's `extractBearerToken` enforces exactly 2 parts, while the old `split(' ')` destructure silently dropped extra segments. Minor hardening, same code family.
 4. **Messages live where each failure is classified, not in the catalog.** Only `code` and `status` are contractual (§2). Auth messages sit at their throw sites — that is where the dynamic `alg` value (`PS256`) is known — and worker-error messages sit in `resolveRuntimeError`, next to the `instanceof` mapping. The `IDLE_TIMEOUT` message deliberately omits the limit value — that Platform nicety is not mirrored.
 5. **`instanceof` via `Deno.errors.*`.** The runtime exposes its worker error classes on the `Deno` global (§3), and the official example main classifies worker failures exactly this way (`examples/main/index.ts:243-255`) — so `resolveRuntimeError` is an `instanceof` chain, with no string matching on error names or messages.
 6. **`EDGE_FUNCTION_ERROR` is a header tag, not a body rewrite.** When the user function fails at request time, the runtime already forwards the plain `500 Internal Server Error` response; `handleWorkerResponse` only adds `sb-error-code: EDGE_FUNCTION_ERROR`, exactly like the Platform. The same code is also the fallback for unrecognized runtime errors in `resolveRuntimeError`, where the raw error goes to `console.error` only — contract messages must not leak internals.
@@ -532,14 +535,15 @@ Prerequisites:
 | --- | --- | --- | --- |
 | 1 | No auth header | `curl -i $BASE/hello` (no `Authorization` header) | 401 + `UNAUTHORIZED_NO_AUTH_HEADER` / `Missing authorization header` |
 | 2 | Bad Bearer format | `curl -i $BASE/hello -H "Authorization: Token abc"` | 401 + `UNAUTHORIZED_INVALID_JWT_FORMAT` / `Auth header is not 'Bearer {token}'` |
-| 3 | Malformed JWT | `curl -i $BASE/hello -H "Authorization: Bearer abc"` | 401 + `UNAUTHORIZED_INVALID_JWT_FORMAT` / `Invalid JWT` |
-| 4 | Unsupported algorithm | `curl -i $BASE/hello -H "Authorization: Bearer <PS256 JWT>"` | 401 + `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` / `Unsupported JWT algorithm PS256` |
-| 5 | Invalid legacy JWT | `curl -i $BASE/hello -H "Authorization: Bearer <HS256 JWT, wrong secret>"` | 401 + `UNAUTHORIZED_LEGACY_JWT` / `Invalid JWT` |
-| 6 | Invalid asymmetric JWT | `curl -i $BASE/hello -H "Authorization: Bearer <ES256/RS256 JWT, unknown key>"` | 401 + `UNAUTHORIZED_ASYMMETRIC_JWT` / `Invalid JWT` |
-| 7 | Function not provided | `curl -i $BASE/` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
-| 8 | Unknown function | `curl -i $BASE/does-not-exist` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
-| 9 | Boot error | `curl -i $BASE/boot-error` (valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
-| 10 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
-| 11 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` / `Function failed due to not having enough compute resources (please check logs)` |
-| 12 | Unhandled error in handler | `curl -i $BASE/error` (valid auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
-| 13 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header |
+| 3 | Bearer with extra parts | `curl -i $BASE/hello -H "Authorization: Bearer abc def"` | 401 + `UNAUTHORIZED_INVALID_JWT_FORMAT` / `Auth header is not 'Bearer {token}'` |
+| 4 | Malformed JWT | `curl -i $BASE/hello -H "Authorization: Bearer abc"` | 401 + `UNAUTHORIZED_INVALID_JWT_FORMAT` / `Invalid JWT` |
+| 5 | Unsupported algorithm | `curl -i $BASE/hello -H "Authorization: Bearer <PS256 JWT>"` | 401 + `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` / `Unsupported JWT algorithm PS256` |
+| 6 | Invalid legacy JWT | `curl -i $BASE/hello -H "Authorization: Bearer <HS256 JWT, wrong secret>"` | 401 + `UNAUTHORIZED_LEGACY_JWT` / `Invalid JWT` |
+| 7 | Invalid asymmetric JWT | `curl -i $BASE/hello -H "Authorization: Bearer <ES256/RS256 JWT, unknown key>"` | 401 + `UNAUTHORIZED_ASYMMETRIC_JWT` / `Invalid JWT` |
+| 8 | Function not provided | `curl -i $BASE/` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
+| 9 | Unknown function | `curl -i $BASE/does-not-exist` (valid auth) | 404 + `NOT_FOUND` / `Requested function was not found` |
+| 10 | Boot error | `curl -i $BASE/boot-error` (valid auth) | 503 + `BOOT_ERROR` / `Function failed to start (please check logs)` |
+| 11 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
+| 12 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` / `Function failed due to not having enough compute resources (please check logs)` |
+| 13 | Unhandled error in handler | `curl -i $BASE/error` (valid auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
+| 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header |
