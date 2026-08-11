@@ -1,4 +1,4 @@
-**Status:** Implemented; pending validation via §8.
+**Status:** Proposed, not implemented yet.
 
 **Scope:**
 
@@ -39,7 +39,8 @@ A failing response carries:
 
 1. a **specific HTTP status code**,
 2. a JSON body of the form **`{ "code": string, "message": string }`**,
-3. an **`sb-error-code`** response header mirroring the body's `code`.
+3. an **`sb-error-code`** response header mirroring the body's `code`,
+4. an **`Access-Control-Expose-Headers`** value covering `sb-error-code`, so cross-origin browser clients can read the header — the docs' own example does `response.headers.get('sb-error-code')`, which returns `null` on a different origin without it. Delivered at the gateway: Envoy already exposes `*` (`volumes/api/envoy/lds.template.yaml:47`); Kong merges it in via a `post-function` (§6.5).
 
 **Only `code` and `status` are fixed.** The `message` is human-readable and can be dynamic — the Platform itself returns two different messages for `UNAUTHORIZED_INVALID_JWT_FORMAT`, and embeds values like the algorithm name (`Unsupported JWT algorithm PS256`). Contract messages never leak runtime internals (stack traces, file paths); those remain available in the function logs — several messages explicitly say "please check logs".
 
@@ -167,8 +168,8 @@ Five files:
     6. `worker.fetch()` responses pass through `handleWorkerResponse`, which tags 5XX with the contract header — body and status preserved, matching the Platform's `500 Internal Server Error` + header behavior.
     7. Worker create/fetch `catch` → `const { def, message } = resolveRuntimeError(e)` + `errorResponse(def, message)`; raw error logged via `console.error`.
 - **`docker-compose.yml` (modified)** — add `-user-worker-request-idle-timeout 150000` to the `functions` command (§4).
-- **`volumes/api/kong.yml` (modified)** — functions `read_timeout` 150s → 160s, so the gateway outlives the idle-timeout response (§4.4, §6.4).
-- **`volumes/api/envoy/lds.template.yaml` (modified)** — same raise for the alternative Envoy gateway (§6.4).
+- **`volumes/api/kong.yml` (modified)** — functions `read_timeout` 150s → 160s, so the gateway outlives the idle-timeout response (§4.4, §6.4), plus a `post-function` on the functions route that merges `sb-error-code` into `Access-Control-Expose-Headers` (§6.5).
+- **`volumes/api/envoy/lds.template.yaml` (modified)** — same raise for the alternative Envoy gateway (§6.4). No CORS change needed here: its virtual-host policy already exposes `*` (§6.5).
 
 ## 6. Proposed code
 
@@ -536,6 +537,46 @@ Raise the gateway's functions timeout above the idle flag, so the runtime always
 
 10s of headroom is ample: when the idle timer fires, the runtime synthesizes the 504 immediately (§4). The gateway must still stay below the wall clock — it does, at 160s < 400s. Both gateways load this config at boot, so recreate the container (`kong` or `envoy`) for the change to take effect.
 
+### 6.5 `volumes/api/kong.yml` — expose `sb-error-code` to browsers (§2 item 4)
+
+The contract header is only useful to a browser client if the response exposes it cross-origin. This is a gateway concern, and the two gateways cover it differently:
+
+- **Envoy needs no change** — its virtual-host CORS policy already sends `expose_headers: "*"` (`lds.template.yaml:41-47`), so every upstream header, `sb-error-code` included, is visible to the browser.
+- **Kong merges it in via `post-function`** on the functions route:
+
+```diff
+   - name: functions-v1
+     _comment: 'Edge Functions: /functions/v1/* -> http://functions:9000/*'
+     url: http://functions:9000/
+     read_timeout: 160000
+     routes:
+       - name: functions-v1-all
+         strip_path: true
+         paths:
+           - /functions/v1/
+     plugins:
+       - name: cors
++      - name: post-function
++        config:
++          header_filter:
++            - |
++              -- Expose sb-error-code to cross-origin browser clients.
++              -- Merge, don't replace: functions may expose their own headers.
++              local expose = kong.response.get_header("Access-Control-Expose-Headers")
++              if expose == nil or expose == "" then
++                kong.response.set_header("Access-Control-Expose-Headers", "sb-error-code")
++              elseif not expose:lower():find("sb-error-code", 1, true) then
++                kong.response.set_header("Access-Control-Expose-Headers", expose .. ", sb-error-code")
++              end
+```
+
+Why not the simpler alternatives (checked against the Kong 3.9.1 sources):
+
+- **`cors` plugin `exposed_headers` config** — the plugin does `kong.response.set_header("Access-Control-Expose-Headers", ...)` (`kong/plugins/cors/handler.lua`), i.e. **replace, not merge**: a function exposing its own headers would lose them. Rejected.
+- **`response-transformer` `append.headers`** — `add_header` semantics would merge in pure config, but the plugin is not in `KONG_PLUGINS` (`docker-compose.yml`) and enabling it buys nothing over `post-function`. Rejected.
+
+`post-function` is already enabled and already used in this file (`kong.yml`, storage route). Its low priority runs it after `cors` in `header_filter`, and the unconfigured `cors` plugin never touches expose-headers — no conflict. The header is added unconditionally on the route (error and success responses alike), mirroring Envoy's `*`; on success responses it is inert. Kong loads this config at boot, so recreate the `kong` container for the change to take effect.
+
 ## 7. Decisions & edge cases
 
 1. **Breaking change: 400 → 404 for a missing function name.** Today `GET /functions/v1/` (empty function segment) answers `400 {"msg":"missing function name in request"}`. The Platform answers `404 NOT_FOUND` for the same request, so this proposal changes the status deliberately. Anything depending on the 400 (health checks, scripts) must be updated.
@@ -546,12 +587,13 @@ Raise the gateway's functions timeout above the idle flag, so the runtime always
 6. **`EDGE_FUNCTION_ERROR` is a header tag, not a body rewrite.** When the user function fails at request time, the runtime already forwards the plain `500 Internal Server Error` response; `handleWorkerResponse` only adds `sb-error-code: EDGE_FUNCTION_ERROR`, exactly like the Platform. The same code is also the fallback for unrecognized runtime errors in `resolveRuntimeError`, where the raw error goes to `console.error` only — contract messages must not leak internals.
 7. **`WorkerRequestCancelled` ambiguity.** OOM kills and wall-clock expiry produce the same error name and message. With the §4 ordering (idle 150s < wall clock 400s), slow functions are claimed by `IDLE_TIMEOUT` first, so `WorkerRequestCancelled → WORKER_RESOURCE_LIMIT` is only reached for genuine resource/termination cases — matching Platform behavior. Residual ambiguity (a 400s-long request being cancelled) is inherent to the runtime and accepted.
 8. **Logging is preserved.** Every catch path still `console.error`s the original error — the contract messages that say "please check logs" rely on it.
+9. **CORS exposure is a gateway concern.** `sb-error-code` only needs exposing to cross-origin browsers, and browsers only reach functions through a gateway — so the merge lives in Kong's `post-function` (§6.5), matching how the repo's Envoy alternative already handles it (`expose_headers: "*"`). The merge-don't-replace semantics matter: user functions may set their own `Access-Control-Expose-Headers`, and Kong's built-in `cors` plugin would have replaced them (§6.5). Direct access to `:9000` is not a browser path (without `Access-Control-Allow-Origin` the response is blocked entirely), so the main worker needs no change for this.
 
 ## 8. Test plan
 
 Prerequisites:
 
-1. Apply the five files: `volumes/functions/main/errors.ts` (§6.1), `volumes/functions/main/index.ts` (§6.2), `docker-compose.yml` (§6.3), `volumes/api/kong.yml` and `volumes/api/envoy/lds.template.yaml` (§6.4).
+1. Apply the five files: `volumes/functions/main/errors.ts` (§6.1), `volumes/functions/main/index.ts` (§6.2), `docker-compose.yml` (§6.3), `volumes/api/kong.yml` (§6.4, §6.5) and `volumes/api/envoy/lds.template.yaml` (§6.4).
 2. In `.env`, set `FUNCTIONS_VERIFY_JWT=true` (default is `false`) and recreate the service: `docker compose up -d --force-recreate functions`. No image rebuild is needed — the code is volume-mounted.
 3. Base URL for all checks: `http://localhost:8000/functions/v1` (via Kong). Use `curl -i` (or `D -`) to inspect status, body, **and** the `sb-error-code` header.
 
@@ -572,3 +614,4 @@ Prerequisites:
 | 13 | Unhandled error in handler | `curl -i $BASE/error` (valid auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
 | 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header |
 | 15 | Invalid response status | `curl -i $BASE/invalid-status` (valid auth) | 500 + `INVALID_RESPONSE_STATUS_CODE` / `Function returned an invalid HTTP status code (please check logs)` |
+| 16 | CORS exposure | `curl -i $BASE/hello` (valid auth), `curl -i $BASE/hello` (no auth), `curl -i $BASE/error` (valid auth) | all carry `access-control-expose-headers` including `sb-error-code` |

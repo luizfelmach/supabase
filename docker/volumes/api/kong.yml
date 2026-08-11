@@ -352,6 +352,18 @@ services:
           - /functions/v1/
     plugins:
       - name: cors
+      - name: post-function
+        config:
+          header_filter:
+            - |
+              -- Expose sb-error-code to cross-origin browser clients.
+              -- Merge, don't replace: functions may expose their own headers.
+              local expose = kong.response.get_header("Access-Control-Expose-Headers")
+              if expose == nil or expose == "" then
+                kong.response.set_header("Access-Control-Expose-Headers", "sb-error-code")
+              elseif not expose:lower():find("sb-error-code", 1, true) then
+                kong.response.set_header("Access-Control-Expose-Headers", expose .. ", sb-error-code")
+              end
 
   ## OAuth 2.0 Authorization Server Metadata (RFC 8414)
   - name: well-known-oauth
