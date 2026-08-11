@@ -1,4 +1,4 @@
-**Status:** Proposal; Not implemented yet.
+**Status:** Implemented; pending validation via §8.
 
 **Scope:**
 
@@ -54,7 +54,7 @@ A failing response carries:
 | `WORKER_RESOURCE_LIMIT` | 546 | ✅ | Execution stopped for exceeding resource limits (memory, CPU time, or too many concurrent operations) |
 | `WORKER_LIMIT` | — | ❌ | Same as `WORKER_RESOURCE_LIMIT` (legacy alias) |
 | `WORKER_ERROR` | 500 | ✅ | Function threw an uncaught exception outside the request handler |
-| `INVALID_RESPONSE_STATUS_CODE` | — | ❌ | Simulating the error, the logs say `The status provided (600) is not equal to 101 and outside the range [200, 599]`, but the error returned to the client does not carry this code |
+| `INVALID_RESPONSE_STATUS_CODE` | 500 | ✅ | Simulating the error, the logs say `The status provided (600) is not equal to 101 and outside the range [200, 599]`, but the error returned to the client does not carry this code (not reproduced on the Platform); self-hosted maps it anyway — see §3.1 |
 
 **Authentication Errors**
 
@@ -95,7 +95,7 @@ The typed errors live in `ext/workers/errors.rs:3-11` (`WorkerError::{RequestCan
 | `WorkerRequestCancelled` | `lib.rs:630-633` (fetch) | `WORKER_RESOURCE_LIMIT` (546) |
 | `WorkerAlreadyRetired` | `lib.rs:634-636` (fetch) | `WORKER_ERROR` (500) — Transient; See the retry algorithm in the docs |
 | `WorkerRequestIdleTimeout` | `lib.rs:637-642` (fetch) | `IDLE_TIMEOUT` (504) |
-| `InvalidWorkerResponse` | `lib.rs:643-647` (fetch) | `WORKER_ERROR` (500) |
+| `InvalidWorkerResponse` | `lib.rs:643-647` (fetch) | `WORKER_ERROR` (500) — or `INVALID_RESPONSE_STATUS_CODE` (500) when the embedded error is the invalid-status `RangeError` (§3.1) |
 
 On the JS side, the runtime reconstructs these as real `Error` subclasses **and exposes them to user code as `Deno.errors.*`**: `ext/runtime/js/errors.js:9-32` builds one class per name (`class extends Error { constructor(msg) { super(msg); this.name = name } }`), registers them via `core.registerErrorClass` (`errors.js:77-82`, wired into every isolate's bootstrap at `ext/runtime/js/bootstrap.js:386`), and exports the full set (`errors.js:131`), which the Deno namespace overrides attach to the `Deno` global (`ext/runtime/js/denoOverrides.js:9`). So in the main worker's `catch (e)`:
 
@@ -112,6 +112,15 @@ On the JS side, the runtime reconstructs these as real `Error` subclasses **and 
 These classes exist on the runtime-provided `Deno` global — they are not part of stock Deno's type definitions. That is fine here: the edge-runtime strips types without type-checking, and this proposal follows the same idiom as the official example.
 
 One ambiguity remains: the runtime reports **both** "function never deployed" and "function failed to boot" as `InvalidWorkerCreation`. To match the Platform (`404 NOT_FOUND` vs `503 BOOT_ERROR`), the main worker does a pre-flight `Deno.stat(servicePath)` before creating the worker: a missing directory means `NOT_FOUND`, so `InvalidWorkerCreation` can be treated strictly as `BOOT_ERROR`.
+
+### 3.1 The invalid-status-code case
+
+`INVALID_RESPONSE_STATUS_CODE` is the one portable code with **no typed error class** — the runtime never raises a dedicated `Deno.errors.*` for it. The signal is a `RangeError` thrown by the vendored `Response` constructor itself: `vendor/deno_fetch/23_response.js:182-186` rejects any status that is not `101` and outside `[200, 599]` with `The status provided (${status}) is not equal to 101 and outside the range [200, 599]`. That `RangeError` reaches the main worker through either of two paths:
+
+1. **Constructor throw at the user worker's module scope** — user code runs `new Response(body, { status: 600 })` at the top level; the exception is recorded during module evaluation and replayed at request time, so `worker.fetch()` rejects with `InvalidWorkerResponse` whose message embeds the `RangeError` text (same mechanics as the §1 uncaught-exception row; `crates/base/src/runtime/mod.rs:1487` → `ext/workers/lib.rs:643-647`, the `None =>` branch). The same constructor call *inside* the request handler behaves differently: the serve machinery catches it and turns it into a plain `500 Internal Server Error` (`ext/runtime/js/http.js:253-261`), which `handleWorkerResponse` tags as `EDGE_FUNCTION_ERROR` — so only out-of-handler throws take this path.
+2. **Proxying an upstream with an invalid status** — the documented trigger (`return fetch(...)` against a server answering e.g. `600`): the wire status is never validated on the way in, so the user worker's response carries it back through the ops channel, and the **main worker** re-constructs the response with `new Response(body, { status, ... })` at `ext/workers/user_workers.js:124-128` — the `RangeError` is then raised directly in the main worker's own isolate.
+
+Both paths are caught by a single check in `resolveRuntimeError`, placed **before** the `InvalidWorkerResponse` branch: `e instanceof Error && e.message.includes('is not equal to 101 and outside the range [200, 599]')`. The matched text is runtime-generated and therefore stable (the runtime image is pinned in `docker-compose.yml`) — this is the single, documented exception to the no-string-matching rule (§7.5).
 
 ## 4. `workerTimeoutMs` vs `-user-worker-request-idle-timeout`
 
@@ -144,10 +153,10 @@ Five files:
 
 - **`volumes/functions/main/errors.ts` (new)** — single source of truth for the contract:
     - `ErrorDefinition` — **`{ code, status }` only** (§2: messages are attached where each failure is classified, not in the catalog).
-    - `ERRORS` — catalog with the 11 portable code/status pairs.
+    - `ERRORS` — catalog with the 12 portable code/status pairs.
     - `errorResponse(def, message)` — builds the contract `Response` (JSON body + `sb-error-code` header).
     - `AuthError` — an `Error` subclass carrying its `ErrorDefinition`, so the JWT path classifies the failure where it is detected.
-    - `resolveRuntimeError(e)` — `instanceof` chain against `Deno.errors.*` (§3), mirroring the official example main; returns the catalog entry **with** its message (worker-error messages are static per class). Unknown errors fall back to `EDGE_FUNCTION_ERROR` so the client always gets the contract shape, while the raw error stays in the logs.
+    - `resolveRuntimeError(e)` — `instanceof` chain against `Deno.errors.*` (§3), mirroring the official example main; returns the catalog entry **with** its message (worker-error messages are static per class). Before the `InvalidWorkerResponse` branch, the runtime-generated invalid-status `RangeError` is detected by message (§3.1) and mapped to `INVALID_RESPONSE_STATUS_CODE`. Unknown errors fall back to `EDGE_FUNCTION_ERROR` so the client always gets the contract shape, while the raw error stays in the logs.
     - `handleWorkerResponse(response)` — post-processing hook for user-worker responses. Today it adds the `sb-error-code: EDGE_FUNCTION_ERROR` header to 5XX responses; anything below 500 passes through untouched.
 - **`volumes/functions/main/index.ts` (modified)** — behavior changes:
     1. `getAuthToken` throws `AuthError(UNAUTHORIZED_NO_AUTH_HEADER, ...)` / `AuthError(UNAUTHORIZED_INVALID_JWT_FORMAT, "Auth header is not 'Bearer {token}'")`. The Bearer parse enforces exactly 2 parts (`Bearer <token>`), mirroring the Platform's `extractBearerToken` — extra segments are rejected instead of silently dropped.
@@ -181,6 +190,7 @@ export const ERRORS: Record<string, ErrorDefinition> = {
   IDLE_TIMEOUT: { code: 'IDLE_TIMEOUT', status: 504 },
   WORKER_RESOURCE_LIMIT: { code: 'WORKER_RESOURCE_LIMIT', status: 546 },
   WORKER_ERROR: { code: 'WORKER_ERROR', status: 500 },
+  INVALID_RESPONSE_STATUS_CODE: { code: 'INVALID_RESPONSE_STATUS_CODE', status: 500 },
 
   // Authentication errors
   UNAUTHORIZED_NO_AUTH_HEADER: { code: 'UNAUTHORIZED_NO_AUTH_HEADER', status: 401 },
@@ -246,6 +256,21 @@ export function resolveRuntimeError(e: unknown): { def: ErrorDefinition; message
     return {
       def: ERRORS.IDLE_TIMEOUT,
       message: 'Request idle timeout limit reached',
+    }
+  }
+  // The runtime reports an invalid response status in one of two ways (§3.1):
+  // a RangeError raised in the main worker itself when user_workers.js
+  // re-constructs the user worker's response, or the same RangeError embedded
+  // in an InvalidWorkerResponse when the constructor threw inside the user
+  // worker. No typed class exists — the runtime-generated message is the only
+  // signal (vendor/deno_fetch/23_response.js:182-186).
+  if (
+    e instanceof Error &&
+    e.message.includes('is not equal to 101 and outside the range [200, 599]')
+  ) {
+    return {
+      def: ERRORS.INVALID_RESPONSE_STATUS_CODE,
+      message: 'Function returned an invalid HTTP status code (please check logs)',
     }
   }
   if (e instanceof Deno.errors.InvalidWorkerResponse) {
@@ -517,7 +542,7 @@ Raise the gateway's functions timeout above the idle flag, so the runtime always
 2. **`NOT_FOUND` vs `BOOT_ERROR`.** Both surface from the runtime as `InvalidWorkerCreation` (§3); the pre-flight `Deno.stat(servicePath)` is what separates "never deployed" (404) from "failed to boot" (503). It adds one `stat` syscall per request — negligible next to a worker boot.
 3. **Bearer parsing is now exact.** `Authorization: Bearer` (no token), `Bearer abc def` (extra parts) and any non-`Bearer` scheme all yield `UNAUTHORIZED_INVALID_JWT_FORMAT`: the Platform's `extractBearerToken` enforces exactly 2 parts, while the old `split(' ')` destructure silently dropped extra segments. Minor hardening, same code family.
 4. **Messages live where each failure is classified, not in the catalog.** Only `code` and `status` are contractual (§2). Auth messages sit at their throw sites — that is where the dynamic `alg` value (`PS256`) is known — and worker-error messages sit in `resolveRuntimeError`, next to the `instanceof` mapping. The `IDLE_TIMEOUT` message deliberately omits the limit value — that Platform nicety is not mirrored.
-5. **`instanceof` via `Deno.errors.*`.** The runtime exposes its worker error classes on the `Deno` global (§3), and the official example main classifies worker failures exactly this way (`examples/main/index.ts:243-255`) — so `resolveRuntimeError` is an `instanceof` chain, with no string matching on error names or messages.
+5. **`instanceof` via `Deno.errors.*`.** The runtime exposes its worker error classes on the `Deno` global (§3), and the official example main classifies worker failures exactly this way (`examples/main/index.ts:243-255`) — so `resolveRuntimeError` is an `instanceof` chain, with no string matching on error names or messages. The single exception is `INVALID_RESPONSE_STATUS_CODE` (§3.1): the runtime exposes no typed class for it, so it is detected by matching the runtime-generated `RangeError` message, ahead of the `InvalidWorkerResponse` branch.
 6. **`EDGE_FUNCTION_ERROR` is a header tag, not a body rewrite.** When the user function fails at request time, the runtime already forwards the plain `500 Internal Server Error` response; `handleWorkerResponse` only adds `sb-error-code: EDGE_FUNCTION_ERROR`, exactly like the Platform. The same code is also the fallback for unrecognized runtime errors in `resolveRuntimeError`, where the raw error goes to `console.error` only — contract messages must not leak internals.
 7. **`WorkerRequestCancelled` ambiguity.** OOM kills and wall-clock expiry produce the same error name and message. With the §4 ordering (idle 150s < wall clock 400s), slow functions are claimed by `IDLE_TIMEOUT` first, so `WorkerRequestCancelled → WORKER_RESOURCE_LIMIT` is only reached for genuine resource/termination cases — matching Platform behavior. Residual ambiguity (a 400s-long request being cancelled) is inherent to the runtime and accepted.
 8. **Logging is preserved.** Every catch path still `console.error`s the original error — the contract messages that say "please check logs" rely on it.
@@ -546,3 +571,6 @@ Prerequisites:
 | 12 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` / `Function failed due to not having enough compute resources (please check logs)` |
 | 13 | Unhandled error in handler | `curl -i $BASE/error` (valid auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
 | 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header |
+| 15 | Invalid response status | `curl -i $BASE/invalid-status` (valid auth) | 500 + `INVALID_RESPONSE_STATUS_CODE` / `Function returned an invalid HTTP status code (please check logs)` |
+
+Scenario 15 uses the committed fixture `volumes/functions/invalid-status/index.ts`, which runs the constructor at module scope (the `initSomething()` pattern, §3.1 path 1) — inside the handler the serve machinery would convert the throw to a plain 500 and the scenario would tag `EDGE_FUNCTION_ERROR` instead.
