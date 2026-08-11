@@ -572,5 +572,3 @@ Prerequisites:
 | 13 | Unhandled error in handler | `curl -i $BASE/error` (valid auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
 | 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header |
 | 15 | Invalid response status | `curl -i $BASE/invalid-status` (valid auth) | 500 + `INVALID_RESPONSE_STATUS_CODE` / `Function returned an invalid HTTP status code (please check logs)` |
-
-Scenario 15 uses the committed fixture `volumes/functions/invalid-status/index.ts`, which runs the constructor at module scope (the `initSomething()` pattern, §3.1 path 1) — inside the handler the serve machinery would convert the throw to a plain 500 and the scenario would tag `EDGE_FUNCTION_ERROR` instead.
