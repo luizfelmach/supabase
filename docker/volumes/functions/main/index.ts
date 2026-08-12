@@ -2,6 +2,8 @@ import * as jose from 'jsr:@panva/jose@6'
 
 console.log('main function started')
 
+const MAX_WORKER_RETRIES = 3
+
 const JWT_SECRET = Deno.env.get('JWT_SECRET')
 const SUPABASE_JWKS = parseJwks(Deno.env.get('SUPABASE_JWKS'))
 const VERIFY_JWT = Deno.env.get('VERIFY_JWT') === 'true'
@@ -152,21 +154,50 @@ Deno.serve(async (req: Request) => {
   const envVarsObj = Deno.env.toObject()
   const envVars = Object.keys(envVarsObj).map((k) => [k, envVarsObj[k]])
 
-  try {
-    const worker = await EdgeRuntime.userWorkers.create({
-      servicePath,
-      memoryLimitMb,
-      workerTimeoutMs,
-      noModuleCache,
-      importMapPath,
-      envVars,
-    })
-    return await worker.fetch(req)
-  } catch (e) {
-    const error = { msg: e.toString() }
-    return new Response(JSON.stringify(error), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    })
+  // TEST ONLY — remove after validation (SOLUTION.md §8)
+  let injected = 0
+
+  const callWorker = async (req: Request, retriesLeft = MAX_WORKER_RETRIES): Promise<Response> => {
+    // Clone before the attempt: fetch() starts streaming the body immediately
+    // and can consume it even when it rejects (SOLUTION.md §4.2), so a retry
+    // needs an untouched branch of the body tee. Skipped when no retry is left.
+    const retryReq = retriesLeft > 0 ? req.clone() : null
+
+    try {
+      const worker = await EdgeRuntime.userWorkers.create({
+        servicePath,
+        memoryLimitMb,
+        workerTimeoutMs,
+        noModuleCache,
+        importMapPath,
+        envVars,
+      })
+      // TEST ONLY — simulate N consecutive retired-worker races (SOLUTION.md §8)
+      if (injected < Number(req.headers.get('x-test-retire') ?? 0)) {
+        injected++
+        await req.text() // a failed fetch may already have consumed the body
+        throw new Deno.errors.WorkerAlreadyRetired(
+          'request cannot be handled because the worker has already retired',
+        )
+      }
+      return await worker.fetch(req)
+    } catch (e) {
+      // Transient: the pooled worker was retired between create() and fetch().
+      // The request is rejected before dispatch, so user code never ran and
+      // retrying is safe even for non-idempotent methods. The clone lost the
+      // internal supabase tag; re-apply it or the retried fetch cannot stream.
+      if (e instanceof Deno.errors.WorkerAlreadyRetired && retryReq) {
+        console.warn(`${service_name}: worker retired before dispatch; retrying (${retriesLeft} left)`)
+        EdgeRuntime.applySupabaseTag(req, retryReq)
+        return await callWorker(retryReq, retriesLeft - 1)
+      }
+      const error = { msg: e.toString() }
+      return new Response(JSON.stringify(error), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
   }
+
+  return await callWorker(req)
 })
