@@ -8,10 +8,7 @@
 
 **References:**
 
-- [Edge Runtime](https://github.com/supabase/edge-runtime) (pinned as `supabase/edge-runtime:v1.74.0` in `docker-compose.yml:444`; line citations refer to that version)
-- [Error codes](https://supabase.com/docs/guides/functions/error-codes)
-- [Status codes](https://supabase.com/docs/guides/functions/status-codes)
-- Sibling proposal: `SOLUTION.md` on branch `rfc/error-codes` (the error-contract port; its §3 table already cross-references this retry algorithm)
+- [Edge Runtime](https://github.com/supabase/edge-runtime)
 
 ## 1. Problem statement
 
@@ -38,10 +35,10 @@ The behavior to port, as observed on the Platform's main worker:
 4. Every other error falls through to the normal error mapping — no retry:
    - `InvalidWorkerCreation` (boot error) is deterministic: retrying boots the same broken function again.
    - `WorkerRequestIdleTimeout` is deterministic per request: the function simply is that slow.
-   - `WorkerRequestCancelled` means the request was already in flight when the supervisor killed the worker — user code ran for an unknown amount of time, so replaying risks double-executing side effects. The official example main has this exact re-poll deliberately commented out (`examples/main/index.ts:255-271`).
+   - `WorkerRequestCancelled` means the request was already in flight when the supervisor killed the worker — user code ran for an unknown amount of time, so replaying risks double-executing side effects. The repo's example main has this exact re-poll deliberately commented out (`examples/main/index.ts:255-271`).
    - `InvalidWorkerResponse` is a user-code error (or the §1 eviction gap) — neither is retryable.
 
-The official example main implements a bare version of this: `callWorker()` recursing on `e instanceof Deno.errors.WorkerAlreadyRetired` (`examples/main/index.ts:221-245`) — but unbounded, and reusing the same `req` without cloning, which breaks retries of requests with bodies (§4.2). The Platform's production version fixes the request handling; this proposal additionally fixes the unbounded recursion with a cap: **`MAX_WORKER_RETRIES = 3`** (§7.2).
+The example main in the edge-runtime repo implements a bare version of this: `callWorker()` recursing on `e instanceof Deno.errors.WorkerAlreadyRetired` (`examples/main/index.ts:221-245`) — but unbounded, and reusing the same `req` without cloning, which breaks retries of requests with bodies (§4.2). The Platform's production version fixes the request handling; this proposal additionally fixes the unbounded recursion with a cap: **`MAX_WORKER_RETRIES = 3`** (§7.2).
 
 ## 3. How the transient failure arises
 
@@ -63,7 +60,7 @@ On the JS side, the runtime reconstructs the typed errors as real `Error` subcla
 if (e instanceof Deno.errors.WorkerAlreadyRetired) { /* retry */ }
 ```
 
-just works — the same classification idiom as the official example main and the error-contract proposal (`rfc/error-codes` SOLUTION.md §3). `e.message` is the Rust message only: `"request cannot be handled because the worker has already retired"` (`ext/workers/errors.rs:7-8`). These classes exist on the runtime-provided `Deno` global — they are not part of stock Deno's type definitions; the edge-runtime strips types without type-checking, so this is fine.
+just works — the same classification idiom the repo's example main uses. `e.message` is the Rust message only: `"request cannot be handled because the worker has already retired"` (`ext/workers/errors.rs:7-8`). These classes exist on the runtime-provided `Deno` global — they are not part of stock Deno's type definitions; the edge-runtime strips types without type-checking, so this is fine.
 
 ## 4. Rebuilding the `Request` for a retry
 
@@ -105,18 +102,17 @@ One file changed, plus two test fixtures:
 
 - **`volumes/functions/main/index.ts` (modified)** — behavior changes:
   1. New module-level constant **`MAX_WORKER_RETRIES = 3`** — the retry budget (§7.2).
-  2. The existing create+fetch `try` block moves into a `callWorker(req, retriesLeft)` closure inside `Deno.serve` — same idiom as the official example main — closing over `servicePath`, `service_name`, and the worker options.
+  2. The existing create+fetch `try` block moves into a `callWorker(req, retriesLeft)` closure inside `Deno.serve` — same idiom as the repo's example main — closing over `servicePath`, `service_name`, and the worker options.
   3. Each attempt clones the request first (§4.2), unless the budget is exhausted.
   4. On `Deno.errors.WorkerAlreadyRetired` with budget left: one `console.warn` (§7.7), `EdgeRuntime.applySupabaseTag(req, retryReq)` (§4.1), recurse with the clone and `retriesLeft - 1`.
   5. Everything else — including a retired error with the budget exhausted — falls through to the **unchanged** `500 { "msg": ... }` mapping. No response-shape change anywhere.
-- **`volumes/functions/echo/index.ts` (new fixture)** — streams the request body back; proves body preservation across a retry (§8).
-- **`volumes/functions/stream/index.ts` (new fixture)** — answers with a delayed multi-chunk stream; proves streaming survives a retry (§8).
+- **`volumes/functions/echo/index.ts` + `volumes/functions/stream/index.ts` (new fixtures)** — `echo` streams the request body back; `stream` answers with five labeled chunks at 100ms intervals. Both exist for the test plan (§8): body preservation and streaming across a retry.
 
 With `MAX_WORKER_RETRIES = 3`, a request gets at most **4 attempts** (1 + 3 retries). In practice a single retry suffices: `create()` never selects a retired worker (§3), so the retry lands on a freshly booted worker whose retire flag cannot be raised within the microsecond-wide window — further retries only matter in churn bursts where several workers expire at once.
 
 ## 6. Proposed code
 
-### 6.1 `volumes/functions/main/index.ts` (changes only)
+`volumes/functions/main/index.ts` (changes only):
 
 **Add the retry-budget constant** (after the startup log):
 
@@ -192,57 +188,22 @@ With `MAX_WORKER_RETRIES = 3`, a request gets at most **4 attempts** (1 + 3 retr
  })
 ```
 
-### 6.2 `volumes/functions/echo/index.ts` (new fixture, complete)
-
-Streams the request body straight back — the response equals whatever the user worker actually received:
-
-```tsx
-Deno.serve((req: Request) => {
-  return new Response(req.body, {
-    headers: { 'Content-Type': 'text/plain' },
-  })
-})
-```
-
-### 6.3 `volumes/functions/stream/index.ts` (new fixture, complete)
-
-Answers with five labeled chunks at 100ms intervals — a streaming response long enough to make a broken stream obvious:
-
-```tsx
-Deno.serve(() => {
-  const encoder = new TextEncoder()
-  const stream = new ReadableStream({
-    async start(controller) {
-      for (let i = 0; i < 5; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
-        controller.enqueue(encoder.encode(`chunk-${i}\n`))
-      }
-      controller.close()
-    },
-  })
-  return new Response(stream, {
-    headers: { 'Content-Type': 'text/plain' },
-  })
-})
-```
-
 ## 7. Decisions & edge cases
 
-1. **Only `WorkerAlreadyRetired` is retried — the eviction variant stays a 500.** The Platform's `doFetch()` recurses on the retired error only, and this proposal keeps that parity deliberately. `InvalidWorkerResponse: user worker not available` (§3) is the same race class, but it arrives **untyped**, sharing its error class with genuine user-code failures; retrying it would require matching the runtime-generated message string, and replaying an `InvalidWorkerResponse` that actually came from user code would double-execute side effects. The no-string-matching rule from the error-contract proposal (`rfc/error-codes` SOLUTION.md §7.5) is kept. It remains a visible, logged 500 — a known gap, same as on the Platform.
+1. **Only `WorkerAlreadyRetired` is retried — the eviction variant stays a 500.** The Platform's `doFetch()` recurses on the retired error only, and this proposal keeps that parity deliberately. `InvalidWorkerResponse: user worker not available` (§3) is the same race class, but it arrives **untyped**, sharing its error class with genuine user-code failures; retrying it would require matching the runtime-generated message string, and replaying an `InvalidWorkerResponse` that actually came from user code would double-execute side effects. Classifying errors by matching message strings is rejected here as too brittle to build behavior on. It remains a visible, logged 500 — a known gap, same as on the Platform.
 2. **Capped at 3 retries via `MAX_WORKER_RETRIES` — not unbounded recursion.** The Platform and the example main recurse without a cap; this is the proposal's one deliberate deviation. The cap bounds worst-case added latency (at most 4 worker boots, seconds each) and makes pathological loops impossible during shutdown churn, when fresh workers may be retired immediately after boot. In practice one retry suffices (§5), so 3 is generous headroom for bursts, and the constant is a single obvious knob. When the cap is exhausted, the client gets the same `500 {"msg":"WorkerAlreadyRetired: ..."}` as today — the failure is no worse than without the change.
 3. **Retrying non-idempotent requests is safe here.** `WorkerAlreadyRetired` is raised in `pool.send_request` **before** the request is dispatched to the worker (`pool.rs:577-583`): user code never ran, no side effect happened, so replaying a POST is exactly as safe as replaying a GET. This is precisely what distinguishes it from `WorkerRequestCancelled`, where the request was already in flight (§2 item 4).
 4. **The clone is per attempt, before the attempt — never in the `catch`.** A failed `fetch()` may already have consumed the body (§4.2), so each attempt tees off an untouched branch for the next one. The alternative — cloning only when a retry is needed — cannot work for requests with bodies; the uniform upfront clone keeps GETs cheap (no body to buffer) and POSTs correct.
 5. **`applySupabaseTag` on every retry, without exception.** Symbol-keyed properties do not survive `Request.clone()`, and the tag is not optional metadata: `fetch()` passes `tag.streamRid`/`tag.watcherRid` into the fetch op unconditionally (§4.1). The original request object keeps its tag even after its body is consumed, so it can always serve as the tag source for the next clone.
-6. **No retry on `InvalidWorkerCreation`, `WorkerRequestIdleTimeout`, or `WorkerRequestCancelled`.** Boot errors are deterministic (retry boots the same broken function); the idle timeout is the function genuinely exceeding the limit; a cancelled request was already in flight with unknown progress (§2 item 4). All three fall through to the existing 500 mapping unchanged — and to the classified contract codes if the error-contract proposal is also applied (§7.8).
+6. **No retry on `InvalidWorkerCreation`, `WorkerRequestIdleTimeout`, or `WorkerRequestCancelled`.** Boot errors are deterministic (retry boots the same broken function); the idle timeout is the function genuinely exceeding the limit; a cancelled request was already in flight with unknown progress (§2 item 4). All three fall through to the existing 500 mapping unchanged.
 7. **The retry is transparent; the only new output is one `console.warn` per retry.** Response shapes are untouched — success or failure, the client cannot tell a retried call from a first-attempt one. The warn line (`worker retired before dispatch; retrying (N left)`) exists so churn is observable in the function logs: a healthy system retries rarely, so any warn rate above noise is a signal worth investigating (e.g. workers expiring faster than expected).
-8. **This proposal stands alone, but composes with the error-contract proposal.** It is written against master and touches none of the same lines as `rfc/error-codes`. If both are applied, the flow is: transient retired errors are absorbed here first; a cap-exhausted `WorkerAlreadyRetired` then falls into the catch-all, where `resolveRuntimeError` maps it to `WORKER_ERROR` (500) — exactly the fallback its §3 table anticipates with "Transient; See the retry algorithm in the docs".
-9. **`Deno.errors.*` is runtime-provided, not stock Deno.** The error classes live on the runtime's `Deno` global (§3) and `EdgeRuntime.applySupabaseTag` on the main-worker-only `EdgeRuntime` namespace (§4.1); neither is part of Deno's standard type definitions. The edge-runtime strips types without type-checking, and the official example main uses the same idioms — so no type shims are needed.
+8. **`Deno.errors.*` is runtime-provided, not stock Deno.** The error classes live on the runtime's `Deno` global (§3) and `EdgeRuntime.applySupabaseTag` on the main-worker-only `EdgeRuntime` namespace (§4.1); neither is part of Deno's standard type definitions. The edge-runtime strips types without type-checking, and the repo's example main uses the same idioms — so no type shims are needed.
 
 ## 8. Test plan
 
 Prerequisites:
 
-1. Apply the three files: `volumes/functions/main/index.ts` (§6.1), `volumes/functions/echo/index.ts` (§6.2), `volumes/functions/stream/index.ts` (§6.3).
+1. Apply `volumes/functions/main/index.ts` (§6) and add the two fixtures: `volumes/functions/echo/index.ts` (streams the request body back) and `volumes/functions/stream/index.ts` (five labeled chunks at 100ms intervals).
 2. Recreate the service: `docker compose up -d --force-recreate functions`. No image rebuild is needed — the code is volume-mounted.
 3. Base URL for all checks: `http://localhost:8000/functions/v1` (via Kong). Watch the retry warn lines with `docker logs -f supabase-edge-functions`.
 
