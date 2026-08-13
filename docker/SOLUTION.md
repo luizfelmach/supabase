@@ -40,7 +40,7 @@ A failing response carries:
 1. a **specific HTTP status code**,
 2. a JSON body of the form **`{ "code": string, "message": string }`**,
 3. an **`sb-error-code`** response header mirroring the body's `code`,
-4. an **`Access-Control-Expose-Headers`** value covering `sb-error-code`, so cross-origin browser clients can read the header — the docs' own example does `response.headers.get('sb-error-code')`, which returns `null` on a different origin without it. Delivered at the gateway: Envoy already exposes `*` (`volumes/api/envoy/lds.template.yaml:47`); Kong merges it in via a `post-function` (§6.5).
+4. an **`Access-Control-Expose-Headers`** value covering `sb-error-code`, so cross-origin browser clients can read the header — the docs' own example does `response.headers.get('sb-error-code')`, which returns `null` on a different origin without it. Delivered by the main function itself: `errorResponse` and `handleWorkerResponse` merge it into every failing response (§6.5), so the contract holds behind any gateway. Envoy's `expose_headers: "*"` (`volumes/api/envoy/lds.template.yaml:47`) is redundant but harmless, and Kong's unconfigured `cors` plugin passes the value through untouched.
 
 **Only `code` and `status` are fixed.** The `message` is human-readable and can be dynamic — the Platform itself returns two different messages for `UNAUTHORIZED_INVALID_JWT_FORMAT`, and embeds values like the algorithm name (`Unsupported JWT algorithm PS256`). Contract messages never leak runtime internals (stack traces, file paths); those remain available in the function logs — several messages explicitly say "please check logs".
 
@@ -155,10 +155,11 @@ Five files:
 - **`volumes/functions/main/errors.ts` (new)** — single source of truth for the contract:
     - `ErrorDefinition` — **`{ code, status }` only** (§2: messages are attached where each failure is classified, not in the catalog).
     - `ERRORS` — catalog with the 12 portable code/status pairs.
-    - `errorResponse(def, message)` — builds the contract `Response` (JSON body + `sb-error-code` header).
+    - `errorResponse(def, message)` — builds the contract `Response` (JSON body + `sb-error-code` header, exposed cross-origin, §6.5).
+    - `exposeErrorCode(headers)` — merges `sb-error-code` into `Access-Control-Expose-Headers` without clobbering user-defined values (§6.5); used by `errorResponse` and `handleWorkerResponse`.
     - `AuthError` — an `Error` subclass carrying its `ErrorDefinition`, so the JWT path classifies the failure where it is detected.
     - `resolveRuntimeError(e)` — `instanceof` chain against `Deno.errors.*` (§3), mirroring the official example main; returns the catalog entry **with** its message (worker-error messages are static per class). Before the `InvalidWorkerResponse` branch, the runtime-generated invalid-status `RangeError` is detected by message (§3.1) and mapped to `INVALID_RESPONSE_STATUS_CODE`. Unknown errors fall back to `EDGE_FUNCTION_ERROR` so the client always gets the contract shape, while the raw error stays in the logs.
-    - `handleWorkerResponse(response)` — post-processing hook for user-worker responses. Today it adds the `sb-error-code: EDGE_FUNCTION_ERROR` header to 5XX responses; anything below 500 passes through untouched.
+    - `handleWorkerResponse(response)` — post-processing hook for user-worker responses. It adds the `sb-error-code: EDGE_FUNCTION_ERROR` header to 5XX responses and merges it into `Access-Control-Expose-Headers`; anything below 500 passes through untouched.
 - **`volumes/functions/main/index.ts` (modified)** — behavior changes:
     1. `getAuthToken` throws `AuthError(UNAUTHORIZED_NO_AUTH_HEADER, ...)` / `AuthError(UNAUTHORIZED_INVALID_JWT_FORMAT, "Auth header is not 'Bearer {token}'")`. The Bearer parse enforces exactly 2 parts (`Bearer <token>`), mirroring the Platform's `extractBearerToken` — extra segments are rejected instead of silently dropped.
     2. JWT verification throws `AuthError`: unsupported `alg` → `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM` with message `Unsupported JWT algorithm <alg>`; HS256 failure → `UNAUTHORIZED_LEGACY_JWT`; ES256/RS256 failure → `UNAUTHORIZED_ASYMMETRIC_JWT`; malformed JWT (`jose.decodeProtectedHeader` throws) → `UNAUTHORIZED_INVALID_JWT_FORMAT`.
@@ -168,7 +169,7 @@ Five files:
     6. `worker.fetch()` responses pass through `handleWorkerResponse`, which tags 5XX with the contract header — body and status preserved, matching the Platform's `500 Internal Server Error` + header behavior.
     7. Worker create/fetch `catch` → `const { def, message } = resolveRuntimeError(e)` + `errorResponse(def, message)`; raw error logged via `console.error`.
 - **`docker-compose.yml` (modified)** — add `-user-worker-request-idle-timeout 150000` to the `functions` command (§4).
-- **`volumes/api/kong.yml` (modified)** — functions `read_timeout` 150s → 160s, so the gateway outlives the idle-timeout response (§4.4, §6.4), plus a `post-function` on the functions route that merges `sb-error-code` into `Access-Control-Expose-Headers` (§6.5).
+- **`volumes/api/kong.yml` (modified)** — functions `read_timeout` 150s → 160s, so the gateway outlives the idle-timeout response (§4.4, §6.4). No CORS change needed: the unconfigured `cors` plugin never touches expose-headers, so the function-set value passes through untouched (§6.5).
 - **`volumes/api/envoy/lds.template.yaml` (modified)** — same raise for the alternative Envoy gateway (§6.4). No CORS change needed here: its virtual-host policy already exposes `*` (§6.5).
 
 ## 6. Proposed code
@@ -201,13 +202,26 @@ export const ERRORS: Record<string, ErrorDefinition> = {
   UNAUTHORIZED_ASYMMETRIC_JWT: { code: 'UNAUTHORIZED_ASYMMETRIC_JWT', status: 401 },
 }
 
+// Expose sb-error-code to cross-origin browser clients. Merge rather than
+// replace so any user-defined exposed headers survive on the passthrough path.
+function exposeErrorCode(headers: Headers): void {
+  const exposed = headers.get('access-control-expose-headers')
+  const names = new Set(
+    exposed?.split(',').map((name) => name.trim()).filter(Boolean) ?? [],
+  )
+  names.add('sb-error-code')
+  headers.set('access-control-expose-headers', [...names].join(', '))
+}
+
 export function errorResponse(def: ErrorDefinition, message: string): Response {
+  const headers = new Headers({
+    'Content-Type': 'application/json',
+    'sb-error-code': def.code,
+  })
+  exposeErrorCode(headers)
   return new Response(JSON.stringify({ code: def.code, message }), {
     status: def.status,
-    headers: {
-      'Content-Type': 'application/json',
-      'sb-error-code': def.code,
-    },
+    headers,
   })
 }
 
@@ -217,6 +231,7 @@ export function handleWorkerResponse(response: Response): Response {
 
   const headers = new Headers(response.headers)
   headers.set('sb-error-code', ERRORS.EDGE_FUNCTION_ERROR.code)
+  exposeErrorCode(headers)
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -537,45 +552,17 @@ Raise the gateway's functions timeout above the idle flag, so the runtime always
 
 10s of headroom is ample: when the idle timer fires, the runtime synthesizes the 504 immediately (§4). The gateway must still stay below the wall clock — it does, at 160s < 400s. Both gateways load this config at boot, so recreate the container (`kong` or `envoy`) for the change to take effect.
 
-### 6.5 `volumes/api/kong.yml` — expose `sb-error-code` to browsers (§2 item 4)
+### 6.5 `volumes/functions/main/errors.ts` — expose `sb-error-code` to browsers (§2 item 4)
 
-The contract header is only useful to a browser client if the response exposes it cross-origin. This is a gateway concern, and the two gateways cover it differently:
+The contract header is only useful to a browser client if the response exposes it cross-origin. The failing response declares that itself: `exposeErrorCode` (§6.1) merges `sb-error-code` into `Access-Control-Expose-Headers` at the two points that can carry the header — `errorResponse` (all classified errors, fresh headers) and `handleWorkerResponse` (5XX pass-through, where the merge preserves any `Access-Control-Expose-Headers` the user function set itself).
 
-- **Envoy needs no change** — its virtual-host CORS policy already sends `expose_headers: "*"` (`lds.template.yaml:41-47`), so every upstream header, `sb-error-code` included, is visible to the browser.
-- **Kong merges it in via `post-function`** on the functions route:
+Why function-level instead of a gateway plugin:
 
-```diff
-   - name: functions-v1
-     _comment: 'Edge Functions: /functions/v1/* -> http://functions:9000/*'
-     url: http://functions:9000/
-     read_timeout: 160000
-     routes:
-       - name: functions-v1-all
-         strip_path: true
-         paths:
-           - /functions/v1/
-     plugins:
-       - name: cors
-+      - name: post-function
-+        config:
-+          header_filter:
-+            - |
-+              -- Expose sb-error-code to cross-origin browser clients.
-+              -- Merge, don't replace: functions may expose their own headers.
-+              local expose = kong.response.get_header("Access-Control-Expose-Headers")
-+              if expose == nil or expose == "" then
-+                kong.response.set_header("Access-Control-Expose-Headers", "sb-error-code")
-+              elseif not expose:lower():find("sb-error-code", 1, true) then
-+                kong.response.set_header("Access-Control-Expose-Headers", expose .. ", sb-error-code")
-+              end
-```
+- **The contract becomes self-contained** — every failing response carries the header no matter which gateway fronts the stack (Kong, Envoy, or the Caddy/nginx compose variants), with zero per-gateway config.
+- **Kong passes it through untouched** — the unconfigured `cors` plugin never sets `Access-Control-Expose-Headers` (checked against the Kong 3.9.1 sources, `kong/plugins/cors/handler.lua`), while still supplying `Access-Control-Allow-Origin` and answering preflights. Its `exposed_headers` config was never an option anyway: the plugin does `kong.response.set_header(...)` — replace, not merge — so a function exposing its own headers would lose them.
+- **Envoy needs no change** — its virtual-host CORS policy already sends `expose_headers: "*"` (`lds.template.yaml:41-47`); the function-set value is redundant there, and harmless.
 
-Why not the simpler alternatives (checked against the Kong 3.9.1 sources):
-
-- **`cors` plugin `exposed_headers` config** — the plugin does `kong.response.set_header("Access-Control-Expose-Headers", ...)` (`kong/plugins/cors/handler.lua`), i.e. **replace, not merge**: a function exposing its own headers would lose them. Rejected.
-- **`response-transformer` `append.headers`** — `add_header` semantics would merge in pure config, but the plugin is not in `KONG_PLUGINS` (`docker-compose.yml`) and enabling it buys nothing over `post-function`. Rejected.
-
-`post-function` is already enabled and already used in this file (`kong.yml`, storage route). Its low priority runs it after `cors` in `header_filter`, and the unconfigured `cors` plugin never touches expose-headers — no conflict. The header is added unconditionally on the route (error and success responses alike), mirroring Envoy's `*`; on success responses it is inert. Kong loads this config at boot, so recreate the `kong` container for the change to take effect.
+Only failing responses carry the header — §2 lists it as a property of *a failing response*. The success pass-through stays untouched: adding it there would force a response rebuild on the happy path (headers of `worker.fetch()` responses are immutable) for an inert header — there is no `sb-error-code` to expose. Direct browser access to `:9000` is still blocked by the missing `Access-Control-Allow-Origin`, unchanged.
 
 ## 7. Decisions & edge cases
 
@@ -587,13 +574,13 @@ Why not the simpler alternatives (checked against the Kong 3.9.1 sources):
 6. **`EDGE_FUNCTION_ERROR` is a header tag, not a body rewrite.** When the user function fails at request time, the runtime already forwards the plain `500 Internal Server Error` response; `handleWorkerResponse` only adds `sb-error-code: EDGE_FUNCTION_ERROR`, exactly like the Platform. The same code is also the fallback for unrecognized runtime errors in `resolveRuntimeError`, where the raw error goes to `console.error` only — contract messages must not leak internals.
 7. **`WorkerRequestCancelled` ambiguity.** OOM kills and wall-clock expiry produce the same error name and message. With the §4 ordering (idle 150s < wall clock 400s), slow functions are claimed by `IDLE_TIMEOUT` first, so `WorkerRequestCancelled → WORKER_RESOURCE_LIMIT` is only reached for genuine resource/termination cases — matching Platform behavior. Residual ambiguity (a 400s-long request being cancelled) is inherent to the runtime and accepted.
 8. **Logging is preserved.** Every catch path still `console.error`s the original error — the contract messages that say "please check logs" rely on it.
-9. **CORS exposure is a gateway concern.** `sb-error-code` only needs exposing to cross-origin browsers, and browsers only reach functions through a gateway — so the merge lives in Kong's `post-function` (§6.5), matching how the repo's Envoy alternative already handles it (`expose_headers: "*"`). The merge-don't-replace semantics matter: user functions may set their own `Access-Control-Expose-Headers`, and Kong's built-in `cors` plugin would have replaced them (§6.5). Direct access to `:9000` is not a browser path (without `Access-Control-Allow-Origin` the response is blocked entirely), so the main worker needs no change for this.
+9. **CORS exposure lives in the function.** Each failing response declares its own exposure — `exposeErrorCode` merges `sb-error-code` into `Access-Control-Expose-Headers` in `errorResponse` and on the 5XX pass-through (§6.5) — so the contract holds behind any gateway (Kong, Envoy, or the Caddy/nginx variants) with zero per-gateway config. The merge-don't-replace semantics still matter: user functions may set their own `Access-Control-Expose-Headers`, and Kong's built-in `cors` plugin would have replaced them had its `exposed_headers` config been used (§6.5). Success responses don't carry the header — §2 defines it as a property of a failing response, and adding it there would force a response rebuild on the happy path for an inert header. Direct access to `:9000` is not a browser path (without `Access-Control-Allow-Origin` the response is blocked entirely), so emitting the header there is harmless.
 
 ## 8. Test plan
 
 Prerequisites:
 
-1. Apply the five files: `volumes/functions/main/errors.ts` (§6.1), `volumes/functions/main/index.ts` (§6.2), `docker-compose.yml` (§6.3), `volumes/api/kong.yml` (§6.4, §6.5) and `volumes/api/envoy/lds.template.yaml` (§6.4).
+1. Apply the five files: `volumes/functions/main/errors.ts` (§6.1, §6.5), `volumes/functions/main/index.ts` (§6.2), `docker-compose.yml` (§6.3), `volumes/api/kong.yml` (§6.4) and `volumes/api/envoy/lds.template.yaml` (§6.4).
 2. In `.env`, set `FUNCTIONS_VERIFY_JWT=true` (default is `false`) and recreate the service: `docker compose up -d --force-recreate functions`. No image rebuild is needed — the code is volume-mounted.
 3. Base URL for all checks: `http://localhost:8000/functions/v1` (via Kong). Use `curl -i` (or `D -`) to inspect status, body, **and** the `sb-error-code` header.
 
@@ -612,6 +599,7 @@ Prerequisites:
 | 11 | Slow function | `curl -i $BASE/hog1` (valid auth) | 504 + `IDLE_TIMEOUT` / `Request idle timeout limit reached` |
 | 12 | Resource limits | `curl -i $BASE/oom` (valid auth) | 546 + `WORKER_RESOURCE_LIMIT` / `Function failed due to not having enough compute resources (please check logs)` |
 | 13 | Unhandled error in handler | `curl -i $BASE/error` (valid auth) | 500 + plain `Internal Server Error` body + `sb-error-code: EDGE_FUNCTION_ERROR` |
-| 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header |
+| 14 | Happy path | `curl -i $BASE/hello` (valid auth) | 200 + unchanged body, no `sb-error-code` header, no `access-control-expose-headers` |
 | 15 | Invalid response status | `curl -i $BASE/invalid-status` (valid auth) | 500 + `INVALID_RESPONSE_STATUS_CODE` / `Function returned an invalid HTTP status code (please check logs)` |
-| 16 | CORS exposure | `curl -i $BASE/hello` (valid auth), `curl -i $BASE/hello` (no auth), `curl -i $BASE/error` (valid auth) | all carry `access-control-expose-headers` including `sb-error-code` |
+| 16 | CORS exposure | `curl -i $BASE/hello` (no auth), `curl -i $BASE/does-not-exist` (valid auth), `curl -i $BASE/error` (valid auth) | every failing response carries `access-control-expose-headers` including `sb-error-code` |
+| 17 | CORS exposure merge | function returning `new Response('err', { status: 500, headers: { 'Access-Control-Expose-Headers': 'x-custom' } })`; `curl -i $BASE/<fn>` (valid auth) | `access-control-expose-headers: x-custom, sb-error-code` — user-defined value preserved |

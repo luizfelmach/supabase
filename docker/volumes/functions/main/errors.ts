@@ -23,13 +23,26 @@ export const ERRORS: Record<string, ErrorDefinition> = {
   UNAUTHORIZED_ASYMMETRIC_JWT: { code: 'UNAUTHORIZED_ASYMMETRIC_JWT', status: 401 },
 }
 
+// Expose sb-error-code to cross-origin browser clients. Merge rather than
+// replace so any user-defined exposed headers survive on the passthrough path.
+function exposeErrorCode(headers: Headers): void {
+  const exposed = headers.get('access-control-expose-headers')
+  const names = new Set(
+    exposed?.split(',').map((name) => name.trim()).filter(Boolean) ?? [],
+  )
+  names.add('sb-error-code')
+  headers.set('access-control-expose-headers', [...names].join(', '))
+}
+
 export function errorResponse(def: ErrorDefinition, message: string): Response {
+  const headers = new Headers({
+    'Content-Type': 'application/json',
+    'sb-error-code': def.code,
+  })
+  exposeErrorCode(headers)
   return new Response(JSON.stringify({ code: def.code, message }), {
     status: def.status,
-    headers: {
-      'Content-Type': 'application/json',
-      'sb-error-code': def.code,
-    },
+    headers,
   })
 }
 
@@ -39,6 +52,7 @@ export function handleWorkerResponse(response: Response): Response {
 
   const headers = new Headers(response.headers)
   headers.set('sb-error-code', ERRORS.EDGE_FUNCTION_ERROR.code)
+  exposeErrorCode(headers)
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
