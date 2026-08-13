@@ -22,8 +22,9 @@ The self-hosted stack has **no memory-pressure handling at all**. Nothing in the
 | Traffic burst ends, workers go idle | Pressure loop drops idle isolates and returns allocator pages to the OS | Idle isolates hold their heaps until the 60s wall clock — regardless of container memory |
 | Steady memory growth (e.g. a leaking function) | Reclaimed as pressure builds, before the limit is hit | Container `memory.current` grows until the host's OOM killer intervenes |
 | Memory budget | 256 MB per instance, watched by the loop | No container limit set in `docker-compose.yml`, and nothing watches usage even if one is set |
+| Per-function memory ceiling | 256 MB per instance | 150 MB per worker (`memoryLimitMb`) — functions that fit on the Platform can OOM self-hosted |
 
-This proposal ports the Platform's loop to the self-hosted main worker, using only primitives the runtime already exposes (§3) and a budget source that works with or without a configured container limit (§4).
+This proposal ports the Platform's loop to the self-hosted main worker, using only primitives the runtime already exposes (§3) and a budget source that works with or without a configured container limit (§4). It also raises the per-worker heap cap from 150 MB to the Platform's 256 MB (§7.8).
 
 ## 2. The Platform memory-pressure handling
 
@@ -64,7 +65,7 @@ The runtime also offers `EdgeRuntime.systemMemoryInfo()` (`namespaces.js:34`), w
 
 For delimiting the problem, the existing per-worker mechanisms and why none of them reacts to container memory:
 
-- `memoryLimitMb = 150` (`volumes/functions/main/index.ts:148`) — kills an **active** worker whose own isolate memory crosses the limit (`Some(_) = memory_limit_rx.recv()` → `ShutdownReason::Memory`, `strategy_per_worker.rs:469`). Idle workers holding memory are untouched, and the container total is never considered.
+- `memoryLimitMb` (150 MB today, raised to 256 MB by this proposal — §7.8; `volumes/functions/main/index.ts:148`) — kills an **active** worker whose own isolate memory crosses the limit (`Some(_) = memory_limit_rx.recv()` → `ShutdownReason::Memory`, `strategy_per_worker.rs:469`). Idle workers holding memory are untouched, and the container total is never considered.
 - `--dispatch-beforeunload-memory-ratio` (default 90%, `cli/src/flags.rs:319-322`) — dispatches `beforeunload` so an individual worker can wind down before its own memory kill. Per-worker grace, not container pressure handling.
 - The 60s wall clock (`workerTimeoutMs`, `index.ts:149`) — the *only* way idle isolates die today, on a fixed timer that is blind to memory.
 
@@ -86,7 +87,7 @@ Two files, plus a test fixture:
   - `readMemoryUsage()` — reads both cgroup files; budget per §4.
   - The loop — a `setInterval` guarded against overlapping ticks: under pressure a tick takes at least as long as the cleanup handshake, so the action rate is self-limiting (§7.3). Per tick: compute the ratio; at or above the threshold, run §3.1's cleanup and §3.2's collect, and emit one `console.warn` with the percentage, the byte figures, and the dropped count.
   - Failure handling — any read error (cgroup v1, non-Linux): one `console.warn`, loop disabled, serving unaffected (§7.6).
-- **`volumes/functions/main/index.ts` (modified)** — import the module and start the loop next to the startup log. Two lines.
+- **`volumes/functions/main/index.ts` (modified)** — import the module and start the loop next to the startup log, and raise `memoryLimitMb` 150 → 256 (§7.8). Three lines.
 - **`volumes/functions/leak/index.ts` (new fixture)** — retains memory per call (with request-parametrized chunk size and delay) so the test plan can drive container memory up on demand (§8).
 
 No `docker-compose.yml` change is required; the optional `mem_limit` hardening appears in §7.1.
@@ -180,6 +181,14 @@ export function startMemoryPressureLoop(): void {
 +startMemoryPressureLoop()
 ```
 
+**Raise the per-worker heap cap to the Platform's per-instance limit** (§7.8):
+
+```diff
+-  const memoryLimitMb = 150
++  const memoryLimitMb = 256
+   const workerTimeoutMs = 1 * 60 * 1000
+```
+
 ## 7. Decisions & edge cases
 
 1. **The budget is what the container actually sees — no new configuration knob.** With a container limit set, `memory.max` is the budget and the ratio is the container's true fill level. Without one (the default), the budget falls back to the host/VM total from `systemMemoryInfo()` (§4): the loop degrades to a last-resort host guard — 80% of the host total is permissive by design, and still strictly better than never acting. Operators who want real isolation set a limit and the loop picks it up automatically, no code change:
@@ -198,7 +207,7 @@ export function startMemoryPressureLoop(): void {
 5. **Busy workers are structurally safe.** The cleanup only drops workers with every request and promise resolved (§3.1); a slow in-flight request is never interrupted by the loop. The only cost of an aggressive tick is cold boots for idle workers that would have been reused.
 6. **Loop failures disable, never break serving.** Any error reading the cgroup files (cgroup v1 hosts, non-Linux) disables the loop after one `console.warn` — request handling in `index.ts` is entirely untouched by the loop. One warn, not a warn per second.
 7. **The 60s wall clock stays.** The loop is additive: idle workers still die at the wall clock; under pressure they merely die *earlier*. Nothing about `workerTimeoutMs` semantics changes.
-8. **`memoryLimitMb = 150` stays orthogonal.** It caps an actively executing worker's heap (§3.4); the loop watches the container. A worker can still be memory-killed mid-request while the container as a whole is fine — that path is unchanged.
+8. **`memoryLimitMb` is raised 150 → 256 MB — per-worker parity with the Platform's instance limit, with the loop as the counterweight.** The Platform gives each function instance 256 MB; self-hosted capped worker heaps at 150 MB, so functions that run fine on the Platform could be memory-killed self-hosted. Raising the cap removes that divergence — and it is exactly why the loop matters more, not less: each worker may now hold up to 256 MB, so the container's worst case grows, and the container-level guard (plus the optional `mem_limit`, §7.1) is what bounds it. The per-worker kill path itself (§3.4) is unchanged — only its threshold. A worker can still be memory-killed mid-request while the container as a whole is fine.
 
 ## 8. Test plan
 
