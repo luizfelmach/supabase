@@ -1,6 +1,9 @@
 import * as jose from 'jsr:@panva/jose@6'
+import { startMemoryPressureLoop } from './memory-pressure.ts'
 
 console.log('main function started')
+
+startMemoryPressureLoop()
 
 const JWT_SECRET = Deno.env.get('JWT_SECRET')
 const SUPABASE_JWKS = parseJwks(Deno.env.get('SUPABASE_JWKS'))
@@ -145,7 +148,7 @@ Deno.serve(async (req: Request) => {
   const servicePath = `/home/deno/functions/${service_name}`
   console.error(`serving the request with ${servicePath}`)
 
-  const memoryLimitMb = 150
+  const memoryLimitMb = 256
   const workerTimeoutMs = 1 * 60 * 1000
   const noModuleCache = false
   const importMapPath = null

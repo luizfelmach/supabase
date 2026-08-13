@@ -4,7 +4,6 @@
 
 - New: `volumes/functions/main/memory-pressure.ts`
 - Modified: `volumes/functions/main/index.ts`
-- New: `volumes/functions/leak/index.ts` (test fixture)
 
 **References:**
 
@@ -80,7 +79,7 @@ cgroup v1 (different file names) is out of scope: if the v2 files cannot be read
 
 ## 5. Design
 
-Two files, plus a test fixture:
+Two files:
 
 - **`volumes/functions/main/memory-pressure.ts` (new)** — self-contained module exporting `startMemoryPressureLoop()`:
   - Constants: `MEMORY_PRESSURE_CHECK_INTERVAL_MS = 1_000`, `MEMORY_PRESSURE_THRESHOLD = 0.8`, `IDLE_WORKER_CLEANUP_TIMEOUT_MS = 1_000` (§7.2).
@@ -88,7 +87,6 @@ Two files, plus a test fixture:
   - The loop — a `setInterval` guarded against overlapping ticks: under pressure a tick takes at least as long as the cleanup handshake, so the action rate is self-limiting (§7.3). Per tick: compute the ratio; at or above the threshold, run §3.1's cleanup and §3.2's collect, and emit one `console.warn` with the percentage, the byte figures, and the dropped count.
   - Failure handling — any read error (cgroup v1, non-Linux): one `console.warn`, loop disabled, serving unaffected (§7.6).
 - **`volumes/functions/main/index.ts` (modified)** — import the module and start the loop next to the startup log, and raise `memoryLimitMb` 150 → 256 (§7.8). Three lines.
-- **`volumes/functions/leak/index.ts` (new fixture)** — retains memory per call (with request-parametrized chunk size and delay) so the test plan can drive container memory up on demand (§8).
 
 No `docker-compose.yml` change is required; the optional `mem_limit` hardening appears in §7.1.
 
@@ -209,21 +207,3 @@ export function startMemoryPressureLoop(): void {
 7. **The 60s wall clock stays.** The loop is additive: idle workers still die at the wall clock; under pressure they merely die *earlier*. Nothing about `workerTimeoutMs` semantics changes.
 8. **`memoryLimitMb` is raised 150 → 256 MB — per-worker parity with the Platform's instance limit, with the loop as the counterweight.** The Platform gives each function instance 256 MB; self-hosted capped worker heaps at 150 MB, so functions that run fine on the Platform could be memory-killed self-hosted. Raising the cap removes that divergence — and it is exactly why the loop matters more, not less: each worker may now hold up to 256 MB, so the container's worst case grows, and the container-level guard (plus the optional `mem_limit`, §7.1) is what bounds it. The per-worker kill path itself (§3.4) is unchanged — only its threshold. A worker can still be memory-killed mid-request while the container as a whole is fine.
 
-## 8. Test plan
-
-Prerequisites:
-
-1. Apply `volumes/functions/main/memory-pressure.ts` (§6.1) and `volumes/functions/main/index.ts` (§6.2), and add the `leak` fixture: `volumes/functions/leak/index.ts` retains `?mb=N` mebibytes per call in a module-scope array and waits `?ms=N` milliseconds before responding (default `mb=10`, `ms=0`).
-2. Recreate the service: `docker compose up -d --force-recreate functions`. No image rebuild is needed — the code is volume-mounted.
-3. Observe: `docker logs -f supabase-edge-functions` for the loop's log lines, and `docker exec supabase-edge-functions cat /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max` (or `docker stats supabase-edge-functions`) for live usage.
-4. Base URL: `http://localhost:8000/functions/v1`. If `FUNCTIONS_VERIFY_JWT=true`, add the usual `Authorization: Bearer <anon key>` header, or use `-X OPTIONS` to skip the main worker's auth block.
-
-Note on budgets: with the default compose (no container limit), the budget is the host total (§4) — deliberately unreachable in a test. Tests 2–4 set a small limit so the threshold is exercisable; test 1 covers the default mode.
-
-| # | Scenario | Trigger | Expected |
-| --- | --- | --- | --- |
-| 1 | Default mode (no limit) | boot; `docker exec ... cat /sys/fs/cgroup/memory.max` → `max` | startup log line `memory pressure loop started`; `curl $BASE/hello` → 200; no warns while idle |
-| 2 | Pressure triggers cleanup | set `deploy.resources.limits.memory: 512M` on `functions`, recreate; then `for i in $(seq 1 40); do curl "$BASE/leak?mb=10"; done` | warn lines `memory pressure: NN% of budget ... dropped N idle worker(s)`; `memory.current` falls after each wave (the idle `leak` worker itself is dropped and its retained memory freed) |
-| 3 | In-flight work is never dropped | during test 2, fire `curl "$BASE/leak?ms=30000"` and keep the leak loop running | the slow request completes with 200; warns report drops of *other* (idle) workers only |
-| 4 | Container limit becomes the budget | same as test 2 — check the warn line's figures | the warn's budget is `512MiB`, proving the cgroup limit won over the host total |
-| 5 | Back to default after tests | remove the limit, recreate | silence again — the loop returns to last-resort host-guard mode |
