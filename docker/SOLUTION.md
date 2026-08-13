@@ -8,7 +8,7 @@
 
 **References:**
 
-- [Edge Runtime](https://github.com/supabase/edge-runtime) (v1.74.0 — the version pinned in `docker-compose.yml`; line citations refer to it)
+- [Edge Runtime](https://github.com/supabase/edge-runtime)
 - [cgroup v2 — kernel documentation](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
 
 ## 1. Problem statement
